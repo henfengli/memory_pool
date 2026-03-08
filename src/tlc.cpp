@@ -101,6 +101,8 @@ TLC* tlc_get_or_create(Arena* arena) {
         b.free_count = 0;
         b.local_free_count = 0;
         b.bucket_idx = i;
+        b.bump_ptr = nullptr;
+        b.bump_limit = nullptr;
         b.page_list = nullptr;
     }
 
@@ -118,24 +120,6 @@ TLC* tlc_get_or_create(Arena* arena) {
     platform::register_thread_exit_callback(on_thread_exit, tlc);
 
     return tlc;
-}
-
-// Build a free list across `num_pages` contiguous pages, each having `blk_per_page` blocks.
-static FreeBlock* init_multi_page_freelist(void* base, size_t block_size,
-                                            uint32_t blk_per_page, uint32_t num_pages) {
-    FreeBlock* head = nullptr;
-    uint8_t* page_base = static_cast<uint8_t*>(base);
-
-    // Build in reverse so first block of first page is at head
-    for (int p = (int)num_pages - 1; p >= 0; p--) {
-        uint8_t* pb = page_base + p * MP_PAGE_SIZE;
-        for (int i = (int)blk_per_page - 1; i >= 0; i--) {
-            FreeBlock* blk = reinterpret_cast<FreeBlock*>(pb + i * block_size);
-            blk->next = head;
-            head = blk;
-        }
-    }
-    return head;
 }
 
 // Calculate how many pages to request in one batch for a given size class.
@@ -177,7 +161,8 @@ static bool bucket_collect_thread_free(Bucket* b) {
     return true;
 }
 
-// Slow path: allocate a batch of pages from the arena
+// Slow path: allocate a batch of pages from the arena.
+// Uses bump pointer (snmalloc/LevelDB style) instead of pre-building a free list.
 static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
     uint32_t idx = b->bucket_idx;
     size_t blk_size = sc_block_size(idx);
@@ -186,7 +171,6 @@ static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
 
     void* pages = arena_alloc_pages(tlc->arena, idx, batch_pages, tlc->thread_id);
     if (!pages) {
-        // Retry with fewer pages if batch was too large
         if (batch_pages > 1) {
             batch_pages = 1;
             pages = arena_alloc_pages(tlc->arena, idx, 1, tlc->thread_id);
@@ -194,9 +178,9 @@ static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
         if (!pages) return false;
     }
 
-    FreeBlock* head = init_multi_page_freelist(pages, blk_size, blk_per_page, batch_pages);
-    b->free_head = head;
-    b->free_count = blk_per_page * batch_pages;
+    // Set up bump pointer region instead of building a free list
+    b->bump_ptr = static_cast<uint8_t*>(pages);
+    b->bump_limit = b->bump_ptr + batch_pages * MP_PAGE_SIZE;
 
     // Track this page range for later cleanup
     b->page_list = page_range_alloc(pages, batch_pages, b->page_list);
@@ -206,8 +190,9 @@ static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
 
 void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
     Bucket& b = tlc->buckets[bucket_idx];
+    size_t blk_size = sc_block_size(bucket_idx);
 
-    // Fast path: pop from free_head
+    // Fast path 1: pop from free_head (recycled blocks)
     if (MP_LIKELY(b.free_head != nullptr)) {
         FreeBlock* blk = b.free_head;
         b.free_head = blk->next;
@@ -218,9 +203,30 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         chunk->pages[pi].used_count.fetch_add(1, std::memory_order_relaxed);
 
         tlc->stats.alloc_count++;
-        tlc->stats.alloc_bytes += sc_block_size(bucket_idx);
+        tlc->stats.alloc_bytes += blk_size;
         tlc->stats.fast_path_hits++;
         return blk;
+    }
+
+    // Fast path 2: bump pointer allocation (no free list pre-build needed)
+    if (MP_LIKELY(b.bump_ptr != nullptr)) {
+        uint8_t* ptr = b.bump_ptr;
+        uint8_t* next = ptr + blk_size;
+        if (MP_LIKELY(next <= b.bump_limit)) {
+            b.bump_ptr = next;
+
+            ChunkHeader* chunk = chunk_of(ptr);
+            uint32_t pi = page_index_of(chunk, ptr);
+            chunk->pages[pi].used_count.fetch_add(1, std::memory_order_relaxed);
+
+            tlc->stats.alloc_count++;
+            tlc->stats.alloc_bytes += blk_size;
+            tlc->stats.fast_path_hits++;
+            return ptr;
+        }
+        // Bump region exhausted
+        b.bump_ptr = nullptr;
+        b.bump_limit = nullptr;
     }
 
     // Slow path 1: collect local_free
@@ -283,6 +289,8 @@ void tlc_flush(TLC* tlc) {
         b.thread_free_head.store(nullptr, std::memory_order_relaxed);
         b.free_count = 0;
         b.local_free_count = 0;
+        b.bump_ptr = nullptr;
+        b.bump_limit = nullptr;
 
         // Return all owned pages to arena
         PageRange* pr = b.page_list;

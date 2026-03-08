@@ -30,6 +30,10 @@ struct Bucket {
     uint32_t  local_free_count; // blocks in local_free_head
     uint32_t  bucket_idx;       // which size class
 
+    // Bump pointer for lazy initialization (snmalloc/LevelDB style)
+    uint8_t*  bump_ptr;         // next block to allocate via bump
+    uint8_t*  bump_limit;       // end of current bump region
+
     PageRange* page_list;       // all pages owned by this bucket
 };
 
