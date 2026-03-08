@@ -171,9 +171,11 @@ MP_API void mp_free(void* ptr) {
     mp::TLC* owner_tlc = pm->owner_tlc;
     if (MP_LIKELY(owner_tlc != nullptr)) {
         mp::tlc_free_remote(&owner_tlc->buckets[bucket_idx], ptr);
+#ifdef MEMPOOL_STATS
         if (tlc) {
             tlc->stats.free_count++;
         }
+#endif
         return;
     }
 }

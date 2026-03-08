@@ -184,7 +184,9 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
     if (MP_LIKELY(b.free_head != nullptr)) {
         FreeBlock* blk = b.free_head;
         b.free_head = blk->next;
+#ifdef MEMPOOL_STATS
         tlc->stats.alloc_count++;
+#endif
         return blk;
     }
 
@@ -195,7 +197,9 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         uint8_t* next = ptr + blk_size;
         if (MP_LIKELY(next <= b.bump_limit)) {
             b.bump_ptr = next;
+#ifdef MEMPOOL_STATS
             tlc->stats.alloc_count++;
+#endif
             return ptr;
         }
         b.bump_ptr = nullptr;
@@ -204,19 +208,25 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
 
     // Slow path 1: collect local_free
     if (bucket_collect_local(&b)) {
+#ifdef MEMPOOL_STATS
         tlc->stats.slow_path_hits++;
+#endif
         return tlc_alloc(tlc, bucket_idx);
     }
 
     // Slow path 2: collect thread_free
     if (bucket_collect_thread_free(&b)) {
+#ifdef MEMPOOL_STATS
         tlc->stats.slow_path_hits++;
+#endif
         return tlc_alloc(tlc, bucket_idx);
     }
 
     // Slow path 3: allocate new batch of pages from arena
     if (bucket_alloc_new_pages(tlc, &b)) {
+#ifdef MEMPOOL_STATS
         tlc->stats.slow_path_hits++;
+#endif
         return tlc_alloc(tlc, bucket_idx);
     }
 
@@ -230,7 +240,9 @@ void tlc_free(TLC* tlc, void* ptr, PageMeta* /*pm*/, uint32_t bucket_idx) {
     blk->next = b.local_free_head;
     b.local_free_head = blk;
 
+#ifdef MEMPOOL_STATS
     tlc->stats.free_count++;
+#endif
 }
 
 void tlc_free_remote(Bucket* bucket, void* ptr) {

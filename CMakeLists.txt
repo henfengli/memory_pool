@@ -10,6 +10,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 option(MEMPOOL_BUILD_TESTS "Build tests" OFF)
 option(MEMPOOL_DEBUG "Enable debug fill and checks" OFF)
+option(MEMPOOL_STATS "Enable per-alloc statistics tracking" OFF)
 
 # --- Library ---
 set(MEMPOOL_SOURCES
@@ -34,6 +35,9 @@ target_include_directories(mempool
 target_compile_definitions(mempool PRIVATE MEMPOOL_BUILDING)
 if(MEMPOOL_DEBUG)
     target_compile_definitions(mempool PUBLIC MEMPOOL_DEBUG=1)
+endif()
+if(MEMPOOL_STATS)
+    target_compile_definitions(mempool PUBLIC MEMPOOL_STATS=1)
 endif()
 
 if(NOT WIN32)

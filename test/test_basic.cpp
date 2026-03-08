@@ -140,7 +140,9 @@ void test_stats_basic() {
     void* p2 = mp_malloc(64);
     mp_stats_t stats;
     mp_stats_get(&stats);
+#ifdef MEMPOOL_STATS
     ASSERT(stats.alloc_count >= 2);
+#endif
     mp_free(p1);
     mp_free(p2);
     mp_shutdown();
