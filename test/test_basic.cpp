@@ -141,7 +141,6 @@ void test_stats_basic() {
     mp_stats_t stats;
     mp_stats_get(&stats);
     ASSERT(stats.alloc_count >= 2);
-    ASSERT(stats.alloc_bytes > 0);
     mp_free(p1);
     mp_free(p2);
     mp_shutdown();

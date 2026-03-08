@@ -13,10 +13,9 @@ struct TLC;   // forward declaration
 struct TLCStats {
     uint64_t alloc_count;
     uint64_t free_count;
-    uint64_t alloc_bytes;
-    uint64_t free_bytes;
     uint64_t slow_path_hits;
     // fast_path_hits = alloc_count - slow_path_hits (derived at aggregate time)
+    // alloc_bytes/free_bytes removed from hot path for performance
 };
 
 /* --- Statistics functions --- */

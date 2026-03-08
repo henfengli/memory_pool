@@ -173,7 +173,6 @@ MP_API void mp_free(void* ptr) {
         mp::tlc_free_remote(&owner_tlc->buckets[bucket_idx], ptr);
         if (tlc) {
             tlc->stats.free_count++;
-            tlc->stats.free_bytes += mp::sc_block_size(bucket_idx);
         }
         return;
     }

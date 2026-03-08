@@ -185,7 +185,6 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         FreeBlock* blk = b.free_head;
         b.free_head = blk->next;
         tlc->stats.alloc_count++;
-        tlc->stats.alloc_bytes += sc_block_size(bucket_idx);
         return blk;
     }
 
@@ -197,7 +196,6 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         if (MP_LIKELY(next <= b.bump_limit)) {
             b.bump_ptr = next;
             tlc->stats.alloc_count++;
-            tlc->stats.alloc_bytes += blk_size;
             return ptr;
         }
         b.bump_ptr = nullptr;
@@ -233,7 +231,6 @@ void tlc_free(TLC* tlc, void* ptr, PageMeta* /*pm*/, uint32_t bucket_idx) {
     b.local_free_head = blk;
 
     tlc->stats.free_count++;
-    tlc->stats.free_bytes += sc_block_size(bucket_idx);
 }
 
 void tlc_free_remote(Bucket* bucket, void* ptr) {

@@ -27,15 +27,11 @@ void stats_aggregate(mp_stats_t* out) {
         for (TLC* tlc = arena->tlc_head; tlc; tlc = tlc->next_in_arena) {
             out->alloc_count    += tlc->stats.alloc_count;
             out->free_count     += tlc->stats.free_count;
-            out->alloc_bytes    += tlc->stats.alloc_bytes;
-            out->free_bytes     += tlc->stats.free_bytes;
             out->slow_path_hits += tlc->stats.slow_path_hits;
         }
-        // fast_path_hits = alloc_count - slow_path_hits (derived, not tracked per-alloc)
+        // Derived stats (not tracked per-alloc for hot path performance)
         out->fast_path_hits = out->alloc_count - out->slow_path_hits;
     }
-
-    out->active_bytes = out->alloc_bytes - out->free_bytes;
 }
 
 void stats_print() {
