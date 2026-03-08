@@ -182,6 +182,13 @@ static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
     b->bump_ptr = static_cast<uint8_t*>(pages);
     b->bump_limit = b->bump_ptr + batch_pages * MP_PAGE_SIZE;
 
+    // Set owner_tlc on all allocated pages for O(1) cross-thread free
+    ChunkHeader* chunk = chunk_of(pages);
+    uint32_t pi_start = page_index_of(chunk, pages);
+    for (uint32_t i = 0; i < batch_pages; i++) {
+        chunk->pages[pi_start + i].owner_tlc = tlc;
+    }
+
     // Track this page range for later cleanup
     b->page_list = page_range_alloc(pages, batch_pages, b->page_list);
 

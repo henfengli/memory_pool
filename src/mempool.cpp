@@ -161,25 +161,18 @@ MP_API void mp_free(void* ptr) {
         }
     }
 
-    // Cross-thread free: find the owning TLC's bucket and CAS push
-    mp::Arena* arena = chunk->arena;
-    if (!arena) return;
+    // Cross-thread free: O(1) via owner_tlc pointer (no mutex, no traversal)
+    mp::TLC* owner_tlc = pm->owner_tlc;
+    if (MP_LIKELY(owner_tlc != nullptr)) {
+        mp::tlc_free_remote(&owner_tlc->buckets[bucket_idx], ptr);
+        pm->used_count.fetch_sub(1, std::memory_order_relaxed);
 
-    // Find the TLC that owns this page
-    std::lock_guard<std::mutex> lock(arena->tlc_mutex);
-    for (mp::TLC* tlc = arena->tlc_head; tlc; tlc = tlc->next_in_arena) {
-        if (tlc->thread_id == pm->owner_thread) {
-            mp::tlc_free_remote(&tlc->buckets[bucket_idx], ptr);
-            pm->used_count.fetch_sub(1, std::memory_order_relaxed);
-
-            // Update stats for the freeing thread's TLC if available
-            mp::TLC* my_tlc = mp::tlc_current();
-            if (my_tlc) {
-                my_tlc->stats.free_count++;
-                my_tlc->stats.free_bytes += mp::sc_block_size(bucket_idx);
-            }
-            return;
+        mp::TLC* my_tlc = mp::tlc_current();
+        if (my_tlc) {
+            my_tlc->stats.free_count++;
+            my_tlc->stats.free_bytes += mp::sc_block_size(bucket_idx);
         }
+        return;
     }
 
     // Owner TLC already destroyed - just decrement used count

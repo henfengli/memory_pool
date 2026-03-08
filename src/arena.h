@@ -18,6 +18,7 @@ struct PageMeta {
     uint16_t block_count;    // total blocks in this page
     std::atomic<uint16_t> used_count; // currently allocated blocks
     uint64_t owner_thread;   // thread that owns this page
+    TLC*     owner_tlc;      // direct pointer to owner TLC (for O(1) cross-thread free)
 };
 
 /* --- ChunkHeader: header at the start of each 4MB chunk --- */
