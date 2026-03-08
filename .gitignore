@@ -1,0 +1,31 @@
+# Build output
+build/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Object files
+*.o
+*.obj
+*.exe
+*.dll
+*.dll.a
+*.so
+*.dylib
+*.a
+*.lib
+
+# Dependency files
+*.d
+
+# Claude
+.claude/
