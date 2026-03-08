@@ -110,8 +110,10 @@ MP_API void mp_shutdown(void) {
 }
 
 MP_API void* mp_malloc(size_t size) {
-    if (MP_UNLIKELY(size == 0)) size = 1;
-    if (MP_UNLIKELY(size > mp::kMaxBlockSize)) return nullptr;
+    // Combine zero and overflow check into single comparison
+    if (MP_UNLIKELY(size - 1 >= mp::kMaxBlockSize)) {
+        if (size == 0) size = 1; else return nullptr;
+    }
 
     // Inline fast path: skip ensure_init() if TLC already exists
     mp::TLC* tlc = mp::tlc_current();
@@ -135,13 +137,17 @@ MP_API void* mp_malloc(size_t size) {
 MP_API void mp_free(void* ptr) {
     if (MP_UNLIKELY(!ptr)) return;
 
-    // Inline resolve for speed: chunk_of + page_index + validity check
+    // Inline resolve: chunk_of + page_index
     mp::ChunkHeader* chunk = mp::chunk_of(ptr);
-    if (MP_UNLIKELY(chunk->magic != MP_CHUNK_MAGIC)) return;
     uint32_t page_idx = mp::page_index_of(chunk, ptr);
-    if (MP_UNLIKELY(page_idx >= MP_USABLE_PAGES)) return;
     mp::PageMeta* pm = &chunk->pages[page_idx];
+
+#ifdef MEMPOOL_DEBUG
+    // Safety checks only in debug mode
+    if (MP_UNLIKELY(chunk->magic != MP_CHUNK_MAGIC)) return;
+    if (MP_UNLIKELY(page_idx >= MP_USABLE_PAGES)) return;
     if (MP_UNLIKELY(pm->block_size == 0)) return;
+#endif
 
 #ifdef MEMPOOL_DEBUG
     // Double-free detection
