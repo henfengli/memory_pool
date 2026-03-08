@@ -4,7 +4,6 @@
 namespace mp {
 
 Arena* arena_create(uint32_t id, const char* name, size_t max_size) {
-    // Allocate the Arena struct itself with system malloc (it's small).
     auto* arena = new Arena();
     arena->id = id;
     if (name) {
@@ -26,8 +25,6 @@ Arena* arena_create(uint32_t id, const char* name, size_t max_size) {
 
 void arena_destroy(Arena* arena) {
     if (!arena) return;
-
-    // Free all chunks. Caller must ensure no concurrent access.
     ChunkHeader* chunk = arena->chunk_head;
     while (chunk) {
         ChunkHeader* next = chunk->next;
@@ -37,15 +34,13 @@ void arena_destroy(Arena* arena) {
     arena->chunk_head = nullptr;
     arena->total_allocated = 0;
     arena->stat_chunk_count.store(0, std::memory_order_relaxed);
-
     delete arena;
 }
 
-// Allocate a new chunk and add it to the arena's chunk list.
 // Caller must hold arena->mutex.
 static ChunkHeader* arena_alloc_chunk(Arena* arena) {
     if (arena->max_size > 0 && arena->total_allocated + MP_CHUNK_SIZE > arena->max_size) {
-        return nullptr; // size limit exceeded
+        return nullptr;
     }
 
     void* mem = platform::chunk_alloc(MP_CHUNK_SIZE, MP_CHUNK_ALIGN);
@@ -54,10 +49,10 @@ static ChunkHeader* arena_alloc_chunk(Arena* arena) {
     auto* chunk = static_cast<ChunkHeader*>(mem);
     chunk->magic = MP_CHUNK_MAGIC;
     chunk->arena = arena;
+    chunk->next_free_hint = 0;
     memset(chunk->page_bitmap, 0, sizeof(chunk->page_bitmap));
     memset(chunk->pages, 0, sizeof(chunk->pages));
 
-    // Insert at head of chunk list
     chunk->next = arena->chunk_head;
     chunk->prev = nullptr;
     if (arena->chunk_head) {
@@ -71,18 +66,29 @@ static ChunkHeader* arena_alloc_chunk(Arena* arena) {
     return chunk;
 }
 
-// Find `count` contiguous free pages in a chunk's bitmap.
-// Returns the starting page index, or -1 if not found.
+// Fast bitmap scan using ctzll to skip entire words of all-ones.
+// Starts from chunk->next_free_hint to avoid rescanning already-full regions.
 static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
-    // Simple scan for `count` contiguous zero bits across the bitmap.
-    uint32_t run = 0;
-    uint32_t start = 0;
+    uint32_t hint = chunk->next_free_hint;
+    if (hint >= MP_USABLE_PAGES) hint = 0;
 
-    for (uint32_t i = 0; i < MP_USABLE_PAGES; i++) {
+    // Scan starting from hint
+    uint32_t run = 0;
+    uint32_t start = hint;
+
+    for (uint32_t i = hint; i < MP_USABLE_PAGES; ) {
         uint32_t word = i / 64;
         uint32_t bit = i % 64;
+
+        // Fast skip: if we're at bit 0 and the entire word is full, skip 64 pages at once
+        if (bit == 0 && count <= 64 && chunk->page_bitmap[word] == ~0ULL) {
+            run = 0;
+            i += 64;
+            start = i;
+            continue;
+        }
+
         if (chunk->page_bitmap[word] & (1ULL << bit)) {
-            // Page is allocated, reset run
             run = 0;
             start = i + 1;
         } else {
@@ -91,11 +97,41 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
                 return (int)start;
             }
         }
+        i++;
     }
+
+    // Wrap around: scan [0, hint) if hint was not 0
+    if (hint > 0) {
+        run = 0;
+        start = 0;
+        uint32_t limit = hint < MP_USABLE_PAGES ? hint : MP_USABLE_PAGES;
+        for (uint32_t i = 0; i < limit; ) {
+            uint32_t word = i / 64;
+            uint32_t bit = i % 64;
+
+            if (bit == 0 && count <= 64 && chunk->page_bitmap[word] == ~0ULL) {
+                run = 0;
+                i += 64;
+                start = i;
+                continue;
+            }
+
+            if (chunk->page_bitmap[word] & (1ULL << bit)) {
+                run = 0;
+                start = i + 1;
+            } else {
+                run++;
+                if (run == count) {
+                    return (int)start;
+                }
+            }
+            i++;
+        }
+    }
+
     return -1;
 }
 
-// Mark pages [start, start+count) as allocated in bitmap.
 static void mark_pages_allocated(ChunkHeader* chunk, uint32_t start, uint32_t count) {
     for (uint32_t i = start; i < start + count; i++) {
         uint32_t word = i / 64;
@@ -104,12 +140,15 @@ static void mark_pages_allocated(ChunkHeader* chunk, uint32_t start, uint32_t co
     }
 }
 
-// Mark pages [start, start+count) as free in bitmap.
 static void mark_pages_free(ChunkHeader* chunk, uint32_t start, uint32_t count) {
     for (uint32_t i = start; i < start + count; i++) {
         uint32_t word = i / 64;
         uint32_t bit = i % 64;
         chunk->page_bitmap[word] &= ~(1ULL << bit);
+    }
+    // Update hint: freed pages are good candidates for next allocation
+    if (start < chunk->next_free_hint) {
+        chunk->next_free_hint = start;
     }
 }
 
@@ -124,8 +163,9 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
         int start = find_free_pages(chunk, count);
         if (start >= 0) {
             mark_pages_allocated(chunk, (uint32_t)start, count);
+            // Advance hint past allocated region
+            chunk->next_free_hint = (uint32_t)start + count;
 
-            // Initialize PageMeta for each page
             for (uint32_t i = 0; i < count; i++) {
                 PageMeta& pm = chunk->pages[start + i];
                 pm.block_size = (uint16_t)blk_size;
@@ -136,8 +176,6 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
             }
 
             void* ptr = page_start(chunk, (uint32_t)start);
-            // Recommit pages in case they were previously decommitted
-            platform::mem_recommit(ptr, count * MP_PAGE_SIZE);
             arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
             return ptr;
         }
@@ -148,9 +186,10 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
     if (!new_chunk) return nullptr;
 
     int start = find_free_pages(new_chunk, count);
-    if (start < 0) return nullptr; // shouldn't happen on a fresh chunk
+    if (start < 0) return nullptr;
 
     mark_pages_allocated(new_chunk, (uint32_t)start, count);
+    new_chunk->next_free_hint = (uint32_t)start + count;
 
     for (uint32_t i = 0; i < count; i++) {
         PageMeta& pm = new_chunk->pages[start + i];
@@ -168,14 +207,13 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
 void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
     ChunkHeader* chunk = chunk_of(ptr);
     if (chunk->magic != MP_CHUNK_MAGIC || chunk->arena != arena) {
-        return; // invalid pointer
+        return;
     }
 
     uint32_t start = page_index_of(chunk, ptr);
 
     std::lock_guard<std::mutex> lock(arena->mutex);
 
-    // Clear page metadata
     for (uint32_t i = 0; i < count; i++) {
         PageMeta& pm = chunk->pages[start + i];
         pm.block_size = 0;
@@ -188,8 +226,9 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
     mark_pages_free(chunk, start, count);
     arena->stat_page_free.fetch_add(count, std::memory_order_relaxed);
 
-    // Optionally decommit the physical memory
-    platform::mem_decommit(ptr, count * MP_PAGE_SIZE);
+    // Note: we intentionally do NOT decommit pages here.
+    // Keeping them committed avoids costly VirtualAlloc(MEM_COMMIT) on reuse.
+    // Physical memory is returned to OS when the entire chunk is freed.
 }
 
 PageMeta* resolve_block_ptr(void* ptr, ChunkHeader** out_chunk) {
@@ -209,7 +248,7 @@ PageMeta* resolve_block_ptr(void* ptr, ChunkHeader** out_chunk) {
     if (page_idx >= MP_USABLE_PAGES) return nullptr;
 
     PageMeta& pm = chunk->pages[page_idx];
-    if (pm.block_size == 0) return nullptr; // page not in use
+    if (pm.block_size == 0) return nullptr;
 
     if (out_chunk) *out_chunk = chunk;
     return &pm;

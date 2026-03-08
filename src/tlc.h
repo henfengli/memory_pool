@@ -13,6 +13,13 @@ struct FreeBlock {
     FreeBlock* next;
 };
 
+/* --- PageRange: tracks a batch of contiguous pages owned by a bucket --- */
+struct PageRange {
+    void*      ptr;    // start of the contiguous pages
+    uint32_t   count;  // number of pages
+    PageRange* next;   // linked list
+};
+
 /* --- Bucket: manages free blocks for one size class --- */
 struct Bucket {
     FreeBlock*               free_head;         // fast path: pop here
@@ -23,9 +30,7 @@ struct Bucket {
     uint32_t  local_free_count; // blocks in local_free_head
     uint32_t  bucket_idx;       // which size class
 
-    // Page tracking: the page(s) this bucket pulls from
-    void*     page_ptr;         // start of the current page
-    uint32_t  page_count;       // number of pages allocated (usually 1)
+    PageRange* page_list;       // all pages owned by this bucket
 };
 
 /* --- TLC: Thread-Local Cache --- */
@@ -39,28 +44,13 @@ struct TLC {
     TLC*     prev_in_arena;
 };
 
-// Get or create the TLC for the current thread, bound to the given arena.
 TLC* tlc_get_or_create(Arena* arena);
-
-// Allocate a block from the given bucket in this TLC.
 void* tlc_alloc(TLC* tlc, uint32_t bucket_idx);
-
-// Free a block. Detects same-thread vs cross-thread automatically.
 void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx);
-
-// Free a block from a different thread via CAS on thread_free_head.
 void tlc_free_remote(Bucket* bucket, void* ptr);
-
-// Flush all buckets in this TLC (called on thread exit or detach).
 void tlc_flush(TLC* tlc);
-
-// Destroy a TLC and remove it from its arena's TLC list.
 void tlc_destroy(TLC* tlc);
-
-// Get the current thread's TLC (nullptr if not attached).
 TLC* tlc_current();
-
-// Set the current thread's TLC.
 void tlc_set_current(TLC* tlc);
 
 } // namespace mp

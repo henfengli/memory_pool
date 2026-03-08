@@ -27,9 +27,11 @@ struct ChunkHeader {
     ChunkHeader* next;            // linked list of chunks in arena
     ChunkHeader* prev;
 
+    // Hint: next page index to start scanning from (avoids O(N²) bitmap scan)
+    uint32_t     next_free_hint;
+
     // Bitmap: 1 bit per usable page (MP_USABLE_PAGES bits).
     // bit=1 means page is allocated, bit=0 means free.
-    // We use 16 uint64_t = 1024 bits, enough for 1008 usable pages.
     uint64_t     page_bitmap[16];
 
     // Page metadata array for usable pages
@@ -63,20 +65,17 @@ struct Arena {
 
 /* --- Inline helpers --- */
 
-// Given any pointer within a chunk, get the ChunkHeader via alignment mask.
 inline ChunkHeader* chunk_of(void* ptr) {
     return reinterpret_cast<ChunkHeader*>(
         reinterpret_cast<uintptr_t>(ptr) & ~(MP_CHUNK_SIZE - 1));
 }
 
-// Given a pointer within a chunk, get the page index (0-based from first usable page).
 inline uint32_t page_index_of(ChunkHeader* chunk, void* ptr) {
     uintptr_t base = reinterpret_cast<uintptr_t>(chunk) + MP_HEADER_PAGES * MP_PAGE_SIZE;
     uintptr_t offset = reinterpret_cast<uintptr_t>(ptr) - base;
     return (uint32_t)(offset / MP_PAGE_SIZE);
 }
 
-// Get pointer to the start of a page given its index.
 inline void* page_start(ChunkHeader* chunk, uint32_t page_idx) {
     return reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(chunk) + (MP_HEADER_PAGES + page_idx) * MP_PAGE_SIZE);
@@ -84,22 +83,10 @@ inline void* page_start(ChunkHeader* chunk, uint32_t page_idx) {
 
 /* --- Arena functions --- */
 
-// Create a new arena. `max_size` of 0 means unlimited.
 Arena* arena_create(uint32_t id, const char* name, size_t max_size);
-
-// Destroy an arena and free all its chunks.
 void arena_destroy(Arena* arena);
-
-// Allocate `count` contiguous pages from the arena for a given size class.
-// Returns pointer to the first page, or nullptr on failure.
-// Sets up PageMeta for each allocated page.
 void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint64_t thread_id);
-
-// Free `count` contiguous pages starting at `ptr`.
 void arena_free_pages(Arena* arena, void* ptr, uint32_t count);
-
-// Resolve a block pointer: find its chunk, page meta, and validate.
-// Returns the PageMeta for the page containing `ptr`, or nullptr if invalid.
 PageMeta* resolve_block_ptr(void* ptr, ChunkHeader** out_chunk);
 
 } // namespace mp

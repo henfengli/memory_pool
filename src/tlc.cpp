@@ -1,6 +1,7 @@
 #include "tlc.h"
 #include <cstring>
 #include <new>
+#include <cstdlib>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -13,7 +14,7 @@
 
 namespace mp {
 
-// --- Platform TLS for TLC pointer (avoids thread_local in DLL on MinGW) ---
+// --- Platform TLS for TLC pointer ---
 #ifdef _WIN32
 
 static DWORD g_tlc_tls_index = TLS_OUT_OF_INDEXES;
@@ -55,7 +56,6 @@ void tlc_set_current(TLC* tlc) {
 
 #endif
 
-// Thread exit callback - cleans up the TLC
 static void on_thread_exit(void* /*arg*/) {
     TLC* tlc = tlc_current();
     if (tlc) {
@@ -65,11 +65,27 @@ static void on_thread_exit(void* /*arg*/) {
     }
 }
 
+// --- PageRange helper ---
+static PageRange* page_range_alloc(void* ptr, uint32_t count, PageRange* next) {
+    auto* pr = static_cast<PageRange*>(malloc(sizeof(PageRange)));
+    pr->ptr = ptr;
+    pr->count = count;
+    pr->next = next;
+    return pr;
+}
+
+static void page_range_free_list(PageRange* list) {
+    while (list) {
+        PageRange* next = list->next;
+        free(list);
+        list = next;
+    }
+}
+
 TLC* tlc_get_or_create(Arena* arena) {
     TLC* tlc = tlc_current();
     if (tlc && tlc->arena == arena) return tlc;
 
-    // Create new TLC
     tlc = new(std::nothrow) TLC();
     if (!tlc) return nullptr;
 
@@ -77,7 +93,6 @@ TLC* tlc_get_or_create(Arena* arena) {
     tlc->thread_id = platform::get_thread_id();
     memset(&tlc->stats, 0, sizeof(tlc->stats));
 
-    // Initialize all buckets
     for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
         Bucket& b = tlc->buckets[i];
         b.free_head = nullptr;
@@ -86,11 +101,9 @@ TLC* tlc_get_or_create(Arena* arena) {
         b.free_count = 0;
         b.local_free_count = 0;
         b.bucket_idx = i;
-        b.page_ptr = nullptr;
-        b.page_count = 0;
+        b.page_list = nullptr;
     }
 
-    // Add to arena's TLC list
     {
         std::lock_guard<std::mutex> lock(arena->tlc_mutex);
         tlc->next_in_arena = arena->tlc_head;
@@ -102,27 +115,39 @@ TLC* tlc_get_or_create(Arena* arena) {
     }
 
     tlc_set_current(tlc);
-
-    // Register thread exit callback
     platform::register_thread_exit_callback(on_thread_exit, tlc);
 
     return tlc;
 }
 
-// Initialize a page as a free list of blocks.
-static FreeBlock* init_page_freelist(void* page, size_t block_size, uint32_t block_count) {
+// Build a free list across `num_pages` contiguous pages, each having `blk_per_page` blocks.
+static FreeBlock* init_multi_page_freelist(void* base, size_t block_size,
+                                            uint32_t blk_per_page, uint32_t num_pages) {
     FreeBlock* head = nullptr;
-    uint8_t* base = static_cast<uint8_t*>(page);
+    uint8_t* page_base = static_cast<uint8_t*>(base);
 
-    for (int i = (int)block_count - 1; i >= 0; i--) {
-        FreeBlock* blk = reinterpret_cast<FreeBlock*>(base + i * block_size);
-        blk->next = head;
-        head = blk;
+    // Build in reverse so first block of first page is at head
+    for (int p = (int)num_pages - 1; p >= 0; p--) {
+        uint8_t* pb = page_base + p * MP_PAGE_SIZE;
+        for (int i = (int)blk_per_page - 1; i >= 0; i--) {
+            FreeBlock* blk = reinterpret_cast<FreeBlock*>(pb + i * block_size);
+            blk->next = head;
+            head = blk;
+        }
     }
     return head;
 }
 
-// Slow path: merge local_free into free_head
+// Calculate how many pages to request in one batch for a given size class.
+// Goal: get at least MP_REFILL_BLOCKS blocks per batch, capped at a reasonable max.
+static uint32_t calc_batch_pages(uint32_t blk_per_page) {
+    if (blk_per_page >= MP_REFILL_BLOCKS) return 1;
+    uint32_t pages = (MP_REFILL_BLOCKS + blk_per_page - 1) / blk_per_page;
+    // Cap at 64 pages per batch (256KB) to avoid excessive single allocations
+    if (pages > 64) pages = 64;
+    return pages;
+}
+
 static bool bucket_collect_local(Bucket* b) {
     if (!b->local_free_head) return false;
 
@@ -136,7 +161,6 @@ static bool bucket_collect_local(Bucket* b) {
     return true;
 }
 
-// Slow path: collect thread_free via atomic exchange
 static bool bucket_collect_thread_free(Bucket* b) {
     FreeBlock* head = b->thread_free_head.exchange(nullptr, std::memory_order_acquire);
     if (!head) return false;
@@ -153,20 +177,30 @@ static bool bucket_collect_thread_free(Bucket* b) {
     return true;
 }
 
-// Slow path: allocate a new page from the arena
-static bool bucket_alloc_new_page(TLC* tlc, Bucket* b) {
+// Slow path: allocate a batch of pages from the arena
+static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
     uint32_t idx = b->bucket_idx;
     size_t blk_size = sc_block_size(idx);
     uint32_t blk_per_page = sc_blocks_per_page(idx);
+    uint32_t batch_pages = calc_batch_pages(blk_per_page);
 
-    void* page = arena_alloc_pages(tlc->arena, idx, 1, tlc->thread_id);
-    if (!page) return false;
+    void* pages = arena_alloc_pages(tlc->arena, idx, batch_pages, tlc->thread_id);
+    if (!pages) {
+        // Retry with fewer pages if batch was too large
+        if (batch_pages > 1) {
+            batch_pages = 1;
+            pages = arena_alloc_pages(tlc->arena, idx, 1, tlc->thread_id);
+        }
+        if (!pages) return false;
+    }
 
-    FreeBlock* head = init_page_freelist(page, blk_size, blk_per_page);
+    FreeBlock* head = init_multi_page_freelist(pages, blk_size, blk_per_page, batch_pages);
     b->free_head = head;
-    b->free_count = blk_per_page;
-    b->page_ptr = page;
-    b->page_count = 1;
+    b->free_count = blk_per_page * batch_pages;
+
+    // Track this page range for later cleanup
+    b->page_list = page_range_alloc(pages, batch_pages, b->page_list);
+
     return true;
 }
 
@@ -179,7 +213,6 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         b.free_head = blk->next;
         b.free_count--;
 
-        // Update page used count
         ChunkHeader* chunk = chunk_of(blk);
         uint32_t pi = page_index_of(chunk, blk);
         chunk->pages[pi].used_count.fetch_add(1, std::memory_order_relaxed);
@@ -202,13 +235,13 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         return tlc_alloc(tlc, bucket_idx);
     }
 
-    // Slow path 3: allocate new page from arena
-    if (bucket_alloc_new_page(tlc, &b)) {
+    // Slow path 3: allocate new batch of pages from arena
+    if (bucket_alloc_new_pages(tlc, &b)) {
         tlc->stats.slow_path_hits++;
         return tlc_alloc(tlc, bucket_idx);
     }
 
-    return nullptr; // out of memory
+    return nullptr;
 }
 
 void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx) {
@@ -253,11 +286,15 @@ void tlc_flush(TLC* tlc) {
         b.free_count = 0;
         b.local_free_count = 0;
 
-        if (b.page_ptr && b.page_count > 0) {
-            arena_free_pages(tlc->arena, b.page_ptr, b.page_count);
-            b.page_ptr = nullptr;
-            b.page_count = 0;
+        // Return all owned pages to arena
+        PageRange* pr = b.page_list;
+        while (pr) {
+            PageRange* next = pr->next;
+            arena_free_pages(tlc->arena, pr->ptr, pr->count);
+            free(pr);
+            pr = next;
         }
+        b.page_list = nullptr;
     }
 }
 
@@ -275,6 +312,11 @@ void tlc_destroy(TLC* tlc) {
         if (tlc->next_in_arena) {
             tlc->next_in_arena->prev_in_arena = tlc->prev_in_arena;
         }
+    }
+
+    // Free any remaining page range tracking nodes (shouldn't happen after flush)
+    for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
+        page_range_free_list(tlc->buckets[i].page_list);
     }
 
     delete tlc;
