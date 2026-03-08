@@ -247,6 +247,8 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
 void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx) {
     Bucket& b = tlc->buckets[bucket_idx];
 
+    // Temporal cadence (mimalloc): push to local_free unconditionally.
+    // No watermark check — merging happens lazily when free_head is empty in tlc_alloc.
     FreeBlock* blk = static_cast<FreeBlock*>(ptr);
     blk->next = b.local_free_head;
     b.local_free_head = blk;
@@ -256,10 +258,6 @@ void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx) {
 
     tlc->stats.free_count++;
     tlc->stats.free_bytes += sc_block_size(bucket_idx);
-
-    if (MP_UNLIKELY(b.local_free_count >= MP_HIGH_WATERMARK)) {
-        bucket_collect_local(&b);
-    }
 }
 
 void tlc_free_remote(Bucket* bucket, void* ptr) {
