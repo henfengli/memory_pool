@@ -165,7 +165,6 @@ MP_API void mp_free(void* ptr) {
     mp::TLC* owner_tlc = pm->owner_tlc;
     if (MP_LIKELY(owner_tlc != nullptr)) {
         mp::tlc_free_remote(&owner_tlc->buckets[bucket_idx], ptr);
-        pm->used_count.fetch_sub(1, std::memory_order_relaxed);
 
         mp::TLC* my_tlc = mp::tlc_current();
         if (my_tlc) {
@@ -174,9 +173,6 @@ MP_API void mp_free(void* ptr) {
         }
         return;
     }
-
-    // Owner TLC already destroyed - just decrement used count
-    pm->used_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
 MP_API void* mp_calloc(size_t count, size_t size) {

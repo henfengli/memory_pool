@@ -205,10 +205,6 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         b.free_head = blk->next;
         b.free_count--;
 
-        ChunkHeader* chunk = chunk_of(blk);
-        uint32_t pi = page_index_of(chunk, blk);
-        chunk->pages[pi].used_count.fetch_add(1, std::memory_order_relaxed);
-
         tlc->stats.alloc_count++;
         tlc->stats.alloc_bytes += blk_size;
         tlc->stats.fast_path_hits++;
@@ -221,10 +217,6 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         uint8_t* next = ptr + blk_size;
         if (MP_LIKELY(next <= b.bump_limit)) {
             b.bump_ptr = next;
-
-            ChunkHeader* chunk = chunk_of(ptr);
-            uint32_t pi = page_index_of(chunk, ptr);
-            chunk->pages[pi].used_count.fetch_add(1, std::memory_order_relaxed);
 
             tlc->stats.alloc_count++;
             tlc->stats.alloc_bytes += blk_size;
@@ -266,8 +258,6 @@ void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx) {
     blk->next = b.local_free_head;
     b.local_free_head = blk;
     b.local_free_count++;
-
-    pm->used_count.fetch_sub(1, std::memory_order_relaxed);
 
     tlc->stats.free_count++;
     tlc->stats.free_bytes += sc_block_size(bucket_idx);
