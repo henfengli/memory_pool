@@ -131,9 +131,13 @@ MP_API void* mp_malloc(size_t size) {
 MP_API void mp_free(void* ptr) {
     if (MP_UNLIKELY(!ptr)) return;
 
-    mp::ChunkHeader* chunk = nullptr;
-    mp::PageMeta* pm = mp::resolve_block_ptr(ptr, &chunk);
-    if (MP_UNLIKELY(!pm)) return; // invalid pointer
+    // Inline resolve for speed: chunk_of + page_index + validity check
+    mp::ChunkHeader* chunk = mp::chunk_of(ptr);
+    if (MP_UNLIKELY(chunk->magic != MP_CHUNK_MAGIC)) return;
+    uint32_t page_idx = mp::page_index_of(chunk, ptr);
+    if (MP_UNLIKELY(page_idx >= MP_USABLE_PAGES)) return;
+    mp::PageMeta* pm = &chunk->pages[page_idx];
+    if (MP_UNLIKELY(pm->block_size == 0)) return;
 
 #ifdef MEMPOOL_DEBUG
     // Double-free detection
@@ -150,26 +154,22 @@ MP_API void mp_free(void* ptr) {
 #endif
 
     uint32_t bucket_idx = pm->bucket_idx;
-    uint64_t my_tid = mp::platform::get_thread_id();
 
-    if (MP_LIKELY(pm->owner_thread == my_tid)) {
-        // Same thread: local free
-        mp::TLC* tlc = mp::tlc_current();
-        if (MP_LIKELY(tlc)) {
-            mp::tlc_free(tlc, ptr, pm, bucket_idx);
-            return;
-        }
+    // Fast path: check if current thread owns this page via TLC pointer comparison
+    // This avoids get_thread_id() system call entirely
+    mp::TLC* tlc = mp::tlc_current();
+    if (MP_LIKELY(tlc != nullptr && pm->owner_tlc == tlc)) {
+        mp::tlc_free(tlc, ptr, pm, bucket_idx);
+        return;
     }
 
-    // Cross-thread free: O(1) via owner_tlc pointer (no mutex, no traversal)
+    // Cross-thread free: O(1) via owner_tlc pointer
     mp::TLC* owner_tlc = pm->owner_tlc;
     if (MP_LIKELY(owner_tlc != nullptr)) {
         mp::tlc_free_remote(&owner_tlc->buckets[bucket_idx], ptr);
-
-        mp::TLC* my_tlc = mp::tlc_current();
-        if (my_tlc) {
-            my_tlc->stats.free_count++;
-            my_tlc->stats.free_bytes += mp::sc_block_size(bucket_idx);
+        if (tlc) {
+            tlc->stats.free_count++;
+            tlc->stats.free_bytes += mp::sc_block_size(bucket_idx);
         }
         return;
     }
