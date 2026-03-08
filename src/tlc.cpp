@@ -98,7 +98,8 @@ TLC* tlc_get_or_create(Arena* arena) {
         b.free_head = nullptr;
         b.local_free_head = nullptr;
         b.thread_free_head.store(nullptr, std::memory_order_relaxed);
-        b.bucket_idx = i;
+        b.bucket_idx = (uint16_t)i;
+        b.block_size = (uint16_t)sc_block_size(i);
         b.bump_ptr = nullptr;
         b.bump_limit = nullptr;
         b.page_list = nullptr;
@@ -192,9 +193,8 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
 
     // Fast path 2: bump pointer allocation
     if (MP_LIKELY(b.bump_ptr != nullptr)) {
-        size_t blk_size = sc_block_size(bucket_idx);
         uint8_t* ptr = b.bump_ptr;
-        uint8_t* next = ptr + blk_size;
+        uint8_t* next = ptr + b.block_size;
         if (MP_LIKELY(next <= b.bump_limit)) {
             b.bump_ptr = next;
 #ifdef MEMPOOL_STATS

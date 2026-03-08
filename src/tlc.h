@@ -26,7 +26,8 @@ struct Bucket {
     FreeBlock*               local_free_head;   // same-thread free pushes here
     std::atomic<FreeBlock*>  thread_free_head;  // cross-thread CAS pushes here
 
-    uint32_t  bucket_idx;       // which size class
+    uint16_t  bucket_idx;       // which size class
+    uint16_t  block_size;       // cached block size (avoids table lookup in bump path)
 
     // Bump pointer for lazy initialization (snmalloc/LevelDB style)
     uint8_t*  bump_ptr;         // next block to allocate via bump
