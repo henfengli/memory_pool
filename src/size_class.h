@@ -17,23 +17,35 @@ static constexpr size_t kSizeClasses[MP_NUM_SIZE_CLASSES] = {
 
 static constexpr size_t kMaxBlockSize = 4096;
 
-// Fast lookup: given a requested size, return the size class index.
+// Pre-computed lookup table: size -> size class index (tcmalloc/rpmalloc style).
+// Table indexed by (size + 15) / 16, covering 0..256 (for sizes 0..4096).
+// Generated at compile time to replace binary search with O(1) table lookup.
+namespace detail {
+    constexpr uint8_t compute_sc_index(size_t slot) {
+        size_t size = slot * 16; // slot = ceil(size/16), size = slot*16 is the upper bound
+        if (size == 0) return 0;
+        for (uint8_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
+            if (kSizeClasses[i] >= size) return i;
+        }
+        return MP_NUM_SIZE_CLASSES - 1;
+    }
+
+    // Build table at compile time
+    struct SCLookupTable {
+        uint8_t data[257]; // indices 0..256 for sizes 0..4096
+        constexpr SCLookupTable() : data{} {
+            for (size_t i = 0; i <= 256; i++) {
+                data[i] = compute_sc_index(i);
+            }
+        }
+    };
+    static constexpr SCLookupTable sc_table{};
+} // namespace detail
+
+// Fast lookup: O(1) table lookup, no branches (tcmalloc/rpmalloc style).
 // Assumes size > 0 && size <= kMaxBlockSize.
 inline uint32_t sc_index_of(size_t size) {
-    if (size <= 128) {
-        // step 16: index = ceil(size/16) - 1
-        return (uint32_t)((size + 15) / 16) - 1;
-    }
-    // Binary search in the remaining classes
-    uint32_t lo = 8, hi = MP_NUM_SIZE_CLASSES - 1;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (kSizeClasses[mid] < size)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
+    return detail::sc_table.data[(size + 15) / 16];
 }
 
 // Return the block size for a given size class index.
