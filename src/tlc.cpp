@@ -128,24 +128,21 @@ static uint32_t calc_batch_pages(uint32_t blk_per_page) {
     return pages;
 }
 
+// Collect local_free into free_head. Called only when free_head is empty,
+// so no need to traverse to find tail — just swap the list pointer.
 static bool bucket_collect_local(Bucket* b) {
     if (!b->local_free_head) return false;
-
-    FreeBlock* tail = b->local_free_head;
-    while (tail->next) tail = tail->next;
-    tail->next = b->free_head;
     b->free_head = b->local_free_head;
     b->local_free_head = nullptr;
     return true;
 }
 
+// Collect thread_free (cross-thread frees) into free_head.
+// Called only when free_head is empty.
 static bool bucket_collect_thread_free(Bucket* b) {
     FreeBlock* head = b->thread_free_head.exchange(nullptr, std::memory_order_acquire);
     if (!head) return false;
-
-    FreeBlock* tail = head;
-    while (tail->next) tail = tail->next;
-    tail->next = b->free_head;
+    // free_head is empty when this is called, so just set it directly
     b->free_head = head;
     return true;
 }
@@ -254,9 +251,7 @@ void tlc_flush(TLC* tlc) {
     for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
         Bucket& b = tlc->buckets[i];
 
-        bucket_collect_local(&b);
-        bucket_collect_thread_free(&b);
-
+        // No need to collect — just discard all lists
         b.free_head = nullptr;
         b.local_free_head = nullptr;
         b.thread_free_head.store(nullptr, std::memory_order_relaxed);

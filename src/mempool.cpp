@@ -111,12 +111,16 @@ MP_API void mp_shutdown(void) {
 
 MP_API void* mp_malloc(size_t size) {
     if (MP_UNLIKELY(size == 0)) size = 1;
-    if (MP_UNLIKELY(size > mp::kMaxBlockSize)) return nullptr; // too large for this pool
+    if (MP_UNLIKELY(size > mp::kMaxBlockSize)) return nullptr;
+
+    // Inline fast path: skip ensure_init() if TLC already exists
+    mp::TLC* tlc = mp::tlc_current();
+    if (MP_UNLIKELY(!tlc || !tlc->arena)) {
+        tlc = mp::get_tlc();
+        if (MP_UNLIKELY(!tlc)) return nullptr;
+    }
 
     uint32_t idx = mp::sc_index_of(size);
-    mp::TLC* tlc = mp::get_tlc();
-    if (MP_UNLIKELY(!tlc)) return nullptr;
-
     void* ptr = mp::tlc_alloc(tlc, idx);
 
 #ifdef MEMPOOL_DEBUG
