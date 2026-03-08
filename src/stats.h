@@ -15,8 +15,8 @@ struct TLCStats {
     uint64_t free_count;
     uint64_t alloc_bytes;
     uint64_t free_bytes;
-    uint64_t fast_path_hits;
     uint64_t slow_path_hits;
+    // fast_path_hits = alloc_count - slow_path_hits (derived at aggregate time)
 };
 
 /* --- Statistics functions --- */
