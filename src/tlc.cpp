@@ -270,6 +270,9 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
     if (MP_LIKELY(b.free_head != nullptr)) {
         FreeBlock* blk = b.free_head;
         b.free_head = blk->next;
+        // Prefetch next-next block for the NEXT alloc call (rpmalloc/smmalloc trick)
+        // Hides linked-list traversal latency by preloading into L1 cache
+        if (blk->next) __builtin_prefetch(blk->next, 0, 3);
 #ifdef MEMPOOL_STATS
         tlc->stats.alloc_count++;
 #endif
