@@ -28,6 +28,7 @@ struct Bucket {
 
     uint16_t  bucket_idx;       // which size class
     uint16_t  block_size;       // cached block size (avoids table lookup in bump path)
+    uint16_t  collect_count;    // collect counter for amortized page reclaim
 
     // Bump pointer for lazy initialization (snmalloc/LevelDB style)
     uint8_t*  bump_ptr;         // next block to allocate via bump

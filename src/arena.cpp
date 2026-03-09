@@ -171,7 +171,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
                 pm.block_size = (uint16_t)blk_size;
                 pm.bucket_idx = (uint16_t)bucket_idx;
                 pm.block_count = (uint16_t)blk_per_page;
-                pm.used_count.store(0, std::memory_order_relaxed);
+                pm.freed_count = 0;
                 pm.owner_thread = thread_id;
                 pm.owner_tlc = nullptr; // set by TLC after return
             }
@@ -197,7 +197,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
         pm.block_size = (uint16_t)blk_size;
         pm.bucket_idx = (uint16_t)bucket_idx;
         pm.block_count = (uint16_t)blk_per_page;
-        pm.used_count.store(0, std::memory_order_relaxed);
+        pm.freed_count = 0;
         pm.owner_thread = thread_id;
         pm.owner_tlc = nullptr;
     }
@@ -221,7 +221,7 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
         pm.block_size = 0;
         pm.bucket_idx = 0;
         pm.block_count = 0;
-        pm.used_count.store(0, std::memory_order_relaxed);
+        pm.freed_count = 0;
         pm.owner_thread = 0;
         pm.owner_tlc = nullptr;
     }

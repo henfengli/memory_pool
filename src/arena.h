@@ -16,7 +16,7 @@ struct PageMeta {
     uint16_t block_size;     // size class block size (0 = unused)
     uint16_t bucket_idx;     // size class index
     uint16_t block_count;    // total blocks in this page
-    std::atomic<uint16_t> used_count; // currently allocated blocks
+    uint16_t freed_count;    // freed blocks counter (non-atomic, owner thread only)
     uint64_t owner_thread;   // thread that owns this page
     TLC*     owner_tlc;      // direct pointer to owner TLC (for O(1) cross-thread free)
 };
