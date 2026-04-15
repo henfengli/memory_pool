@@ -11,6 +11,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 option(MEMPOOL_BUILD_TESTS "Build tests" OFF)
 option(MEMPOOL_DEBUG "Enable debug fill and checks" OFF)
 option(MEMPOOL_STATS "Enable per-alloc statistics tracking" OFF)
+option(MEMPOOL_USE_CTZ "Use CTZ intrinsic for bitmap scanning" OFF)
 
 # --- Library ---
 set(MEMPOOL_SOURCES
@@ -38,6 +39,9 @@ if(MEMPOOL_DEBUG)
 endif()
 if(MEMPOOL_STATS)
     target_compile_definitions(mempool PUBLIC MEMPOOL_STATS=1)
+endif()
+if(MEMPOOL_USE_CTZ)
+    target_compile_definitions(mempool PUBLIC MEMPOOL_USE_CTZ=1)
 endif()
 
 if(NOT WIN32)
