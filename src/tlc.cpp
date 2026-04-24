@@ -355,10 +355,17 @@ void tlc_flush(TLC* tlc) {
     for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
         Bucket& b = tlc->buckets[i];
 
-        // No need to collect — just discard all lists
+        // Collect thread_free first to compensate freed_count before page reclaim
+        FreeBlock* remote = b.thread_free_head.exchange(nullptr, std::memory_order_acquire);
+        while (remote) {
+            ChunkHeader* chunk = chunk_of(remote);
+            uint32_t pi = page_index_of(chunk, remote);
+            chunk->pages[pi].freed_count++;
+            remote = remote->next;
+        }
+
         b.free_head = nullptr;
         b.local_free_head = nullptr;
-        b.thread_free_head.store(nullptr, std::memory_order_relaxed);
         b.bump_ptr = nullptr;
         b.bump_limit = nullptr;
 

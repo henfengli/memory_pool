@@ -29,11 +29,12 @@ struct ChunkHeader {
     ChunkHeader* prev;
 
     // Hint: next page index to start scanning from (avoids O(N²) bitmap scan)
-    uint32_t     next_free_hint;
+    std::atomic<uint32_t> next_free_hint;
 
     // Bitmap: 1 bit per usable page (MP_USABLE_PAGES bits).
     // bit=1 means page is allocated, bit=0 means free.
-    uint64_t     page_bitmap[16];
+    // Atomic for lock-free CAS operations
+    std::atomic<uint64_t> page_bitmap[16];
 
     // Page metadata array for usable pages
     PageMeta     pages[MP_USABLE_PAGES];

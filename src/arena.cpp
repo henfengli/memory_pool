@@ -79,12 +79,140 @@ static inline int ctz64(uint64_t x) {
 }
 #endif
 
+// CAS-based lock-free bitmap operations (inspired by mimalloc)
+// Try to atomically find and claim `count` consecutive free bits in a single word.
+// Returns the starting bit index on success, -1 on failure.
+static int bitmap_try_claim_in_word(std::atomic<uint64_t>* word, uint32_t count, uint32_t bit_offset) {
+    if (count == 0 || count > 64) return -1;
+
+    uint64_t map = word->load(std::memory_order_relaxed);
+
+    // Quick check: if word is full, skip
+    if (map == ~0ULL) return -1;
+
+    const uint64_t mask_template = (count >= 64) ? ~0ULL : ((1ULL << count) - 1);
+    const uint32_t max_bitidx = 64 - count;
+
+    // Start from bit_offset
+    uint32_t bitidx = bit_offset;
+
+#ifdef MEMPOOL_USE_CTZ
+    // Use CTZ to quickly find first zero bit
+    if (map != 0) {
+        int first_zero = ctz64(~map);
+        if (first_zero >= (int)bit_offset) {
+            bitidx = first_zero;
+        }
+    }
+#endif
+
+    // Scan for free bit sequence
+    while (bitidx <= max_bitidx) {
+        uint64_t mask = mask_template << bitidx;
+
+        // Check if these bits are free
+        if ((map & mask) == 0) {
+            // Try to claim with CAS
+            uint64_t newmap = map | mask;
+            if (word->compare_exchange_weak(map, newmap,
+                                           std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+                // Success!
+                return (int)bitidx;
+            }
+            // CAS failed, map is updated to current value, retry
+            continue;
+        }
+
+        // These bits are occupied, move to next position
+#ifdef MEMPOOL_USE_CTZ
+        // Use CTZ to skip to next potential free bit
+        uint64_t occupied = map & mask;
+        if (occupied != 0) {
+            int skip = 64 - ctz64(occupied) - bitidx;
+            bitidx += (skip > 0) ? skip : 1;
+        } else {
+            bitidx++;
+        }
+#else
+        bitidx++;
+#endif
+    }
+
+    return -1;
+}
+
+// Try to atomically claim `count` consecutive pages starting from `start_page`.
+// Returns true on success. This is used when we know exactly which pages to claim.
+static bool bitmap_try_claim_at(ChunkHeader* chunk, uint32_t start_page, uint32_t count) {
+    uint32_t end = start_page + count;
+    uint32_t word_start = start_page / 64;
+    uint32_t word_end = (end - 1) / 64;
+
+    if (word_start == word_end) {
+        // All bits in same word: single CAS
+        uint32_t bit_lo = start_page % 64;
+        uint64_t mask = ((count >= 64) ? ~0ULL : ((1ULL << count) - 1)) << bit_lo;
+
+        uint64_t old = chunk->page_bitmap[word_start].load(std::memory_order_relaxed);
+        // Check if bits are free
+        if ((old & mask) != 0) return false;
+
+        uint64_t newval = old | mask;
+        return chunk->page_bitmap[word_start].compare_exchange_strong(
+            old, newval, std::memory_order_acquire, std::memory_order_relaxed);
+    } else {
+        // Cross-word: not supported in lock-free mode, return false
+        return false;
+    }
+}
+
+// Atomically release `count` pages starting from `start_page`.
+static void bitmap_release_pages(ChunkHeader* chunk, uint32_t start_page, uint32_t count) {
+    uint32_t end = start_page + count;
+    uint32_t word_start = start_page / 64;
+    uint32_t word_end = (end - 1) / 64;
+
+    if (word_start == word_end) {
+        // Single word: atomic AND
+        uint32_t bit_lo = start_page % 64;
+        uint64_t mask = ((count >= 64) ? ~0ULL : ((1ULL << count) - 1)) << bit_lo;
+        chunk->page_bitmap[word_start].fetch_and(~mask, std::memory_order_release);
+    } else {
+        // Multi-word: atomic AND on each word
+        uint32_t first_bit = start_page % 64;
+        chunk->page_bitmap[word_start].fetch_and(~(~0ULL << first_bit), std::memory_order_release);
+
+        for (uint32_t w = word_start + 1; w < word_end; w++) {
+            chunk->page_bitmap[w].store(0, std::memory_order_release);
+        }
+
+        uint32_t last_bits = end % 64;
+        if (last_bits > 0) {
+            chunk->page_bitmap[word_end].fetch_and(~((1ULL << last_bits) - 1), std::memory_order_release);
+        } else {
+            chunk->page_bitmap[word_end].store(0, std::memory_order_release);
+        }
+    }
+
+    // Update hint atomically
+    uint32_t old_hint = chunk->next_free_hint.load(std::memory_order_relaxed);
+    while (start_page < old_hint) {
+        if (chunk->next_free_hint.compare_exchange_weak(old_hint, start_page,
+                                                        std::memory_order_relaxed,
+                                                        std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
 // Fast bitmap scan using ctzll to skip entire words of all-ones.
 // Starts from chunk->next_free_hint to avoid rescanning already-full regions.
+// NOTE: This is now a read-only scan for atomic bitmap
 #ifdef MEMPOOL_USE_CTZ
 // CTZ-optimized version: use ctz64 to quickly find next free bit
 static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
-    uint32_t hint = chunk->next_free_hint;
+    uint32_t hint = chunk->next_free_hint.load(std::memory_order_relaxed);
     if (hint >= MP_USABLE_PAGES) hint = 0;
 
     uint32_t run = 0;
@@ -93,7 +221,7 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
     for (uint32_t i = hint; i < MP_USABLE_PAGES; ) {
         uint32_t word = i / 64;
         uint32_t bit = i % 64;
-        uint64_t w = chunk->page_bitmap[word];
+        uint64_t w = chunk->page_bitmap[word].load(std::memory_order_relaxed);
 
         // Fast skip: entire word is full
         if (bit == 0 && w == ~0ULL) {
@@ -173,7 +301,7 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
 #else
 // Original version: bit-by-bit scan
 static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
-    uint32_t hint = chunk->next_free_hint;
+    uint32_t hint = chunk->next_free_hint.load(std::memory_order_relaxed);
     if (hint >= MP_USABLE_PAGES) hint = 0;
 
     // Scan starting from hint
@@ -184,15 +312,17 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
         uint32_t word = i / 64;
         uint32_t bit = i % 64;
 
+        uint64_t w = chunk->page_bitmap[word].load(std::memory_order_relaxed);
+
         // Fast skip: if we're at bit 0 and the entire word is full, skip 64 pages at once
-        if (bit == 0 && count <= 64 && chunk->page_bitmap[word] == ~0ULL) {
+        if (bit == 0 && count <= 64 && w == ~0ULL) {
             run = 0;
             i += 64;
             start = i;
             continue;
         }
 
-        if (chunk->page_bitmap[word] & (1ULL << bit)) {
+        if (w & (1ULL << bit)) {
             run = 0;
             start = i + 1;
         } else {
@@ -213,14 +343,16 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
             uint32_t word = i / 64;
             uint32_t bit = i % 64;
 
-            if (bit == 0 && count <= 64 && chunk->page_bitmap[word] == ~0ULL) {
+            uint64_t w = chunk->page_bitmap[word].load(std::memory_order_relaxed);
+
+            if (bit == 0 && count <= 64 && w == ~0ULL) {
                 run = 0;
                 i += 64;
                 start = i;
                 continue;
             }
 
-            if (chunk->page_bitmap[word] & (1ULL << bit)) {
+            if (w & (1ULL << bit)) {
                 run = 0;
                 start = i + 1;
             } else {
@@ -237,77 +369,21 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
 }
 #endif
 
-// Batch bitmap set: use word-level masks instead of per-bit loops
-static void mark_pages_allocated(ChunkHeader* chunk, uint32_t start, uint32_t count) {
-    uint32_t end = start + count;
-    uint32_t word_start = start / 64;
-    uint32_t word_end = (end - 1) / 64;
-
-    if (word_start == word_end) {
-        // All bits in same word: single OR
-        uint32_t bit_lo = start % 64;
-        uint64_t mask = ((count >= 64) ? ~0ULL : ((1ULL << count) - 1)) << bit_lo;
-        chunk->page_bitmap[word_start] |= mask;
-    } else {
-        // First partial word
-        uint32_t first_bit = start % 64;
-        chunk->page_bitmap[word_start] |= (~0ULL << first_bit);
-        // Full middle words
-        for (uint32_t w = word_start + 1; w < word_end; w++) {
-            chunk->page_bitmap[w] = ~0ULL;
-        }
-        // Last partial word
-        uint32_t last_bits = end % 64;
-        if (last_bits > 0) {
-            chunk->page_bitmap[word_end] |= ((1ULL << last_bits) - 1);
-        } else {
-            chunk->page_bitmap[word_end] = ~0ULL;
-        }
-    }
-}
-
-// Batch bitmap clear: use word-level masks instead of per-bit loops
-static void mark_pages_free(ChunkHeader* chunk, uint32_t start, uint32_t count) {
-    uint32_t end = start + count;
-    uint32_t word_start = start / 64;
-    uint32_t word_end = (end - 1) / 64;
-
-    if (word_start == word_end) {
-        uint32_t bit_lo = start % 64;
-        uint64_t mask = ((count >= 64) ? ~0ULL : ((1ULL << count) - 1)) << bit_lo;
-        chunk->page_bitmap[word_start] &= ~mask;
-    } else {
-        uint32_t first_bit = start % 64;
-        chunk->page_bitmap[word_start] &= ~(~0ULL << first_bit);
-        for (uint32_t w = word_start + 1; w < word_end; w++) {
-            chunk->page_bitmap[w] = 0;
-        }
-        uint32_t last_bits = end % 64;
-        if (last_bits > 0) {
-            chunk->page_bitmap[word_end] &= ~((1ULL << last_bits) - 1);
-        } else {
-            chunk->page_bitmap[word_end] = 0;
-        }
-    }
-    // Update hint: freed pages are good candidates for next allocation
-    if (start < chunk->next_free_hint) {
-        chunk->next_free_hint = start;
-    }
-}
-
+// Lock-free arena_alloc_pages: CAS bitmap + mutex only for new chunk allocation
 void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint64_t thread_id) {
-    std::lock_guard<std::mutex> lock(arena->mutex);
-
     size_t blk_size = sc_block_size(bucket_idx);
     uint32_t blk_per_page = sc_blocks_per_page(bucket_idx);
 
-    // Try existing chunks first
+    // Phase 1 (lock-free): try to CAS-claim pages in existing chunks
     for (ChunkHeader* chunk = arena->chunk_head; chunk; chunk = chunk->next) {
+        // Find candidate position (read-only scan)
         int start = find_free_pages(chunk, count);
-        if (start >= 0) {
-            mark_pages_allocated(chunk, (uint32_t)start, count);
-            // Advance hint past allocated region
-            chunk->next_free_hint = (uint32_t)start + count;
+        if (start < 0) continue;
+
+        // Try to atomically claim these pages via CAS
+        if (bitmap_try_claim_at(chunk, (uint32_t)start, count)) {
+            // CAS succeeded — we own these pages, no lock needed for PageMeta
+            chunk->next_free_hint.store((uint32_t)start + count, std::memory_order_relaxed);
 
             for (uint32_t i = 0; i < count; i++) {
                 PageMeta& pm = chunk->pages[start + i];
@@ -316,39 +392,86 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
                 pm.block_count = (uint16_t)blk_per_page;
                 pm.freed_count = 0;
                 pm.owner_thread = thread_id;
-                pm.owner_tlc = nullptr; // set by TLC after return
+                pm.owner_tlc = nullptr;
             }
 
-            void* ptr = page_start(chunk, (uint32_t)start);
             arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
-            return ptr;
+            return page_start(chunk, (uint32_t)start);
+        }
+        // CAS failed — another thread claimed these pages, retry scan on same chunk
+        // (find_free_pages will find a different position next time due to updated bitmap)
+        start = find_free_pages(chunk, count);
+        if (start >= 0 && bitmap_try_claim_at(chunk, (uint32_t)start, count)) {
+            chunk->next_free_hint.store((uint32_t)start + count, std::memory_order_relaxed);
+
+            for (uint32_t i = 0; i < count; i++) {
+                PageMeta& pm = chunk->pages[start + i];
+                pm.block_size = (uint16_t)blk_size;
+                pm.bucket_idx = (uint16_t)bucket_idx;
+                pm.block_count = (uint16_t)blk_per_page;
+                pm.freed_count = 0;
+                pm.owner_thread = thread_id;
+                pm.owner_tlc = nullptr;
+            }
+
+            arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
+            return page_start(chunk, (uint32_t)start);
         }
     }
 
-    // No space in existing chunks, allocate a new one
-    ChunkHeader* new_chunk = arena_alloc_chunk(arena);
-    if (!new_chunk) return nullptr;
+    // Phase 2 (locked): no space in existing chunks, allocate a new one
+    {
+        std::lock_guard<std::mutex> lock(arena->mutex);
 
-    int start = find_free_pages(new_chunk, count);
-    if (start < 0) return nullptr;
+        // Double-check: another thread may have added a chunk while we waited
+        for (ChunkHeader* chunk = arena->chunk_head; chunk; chunk = chunk->next) {
+            int start = find_free_pages(chunk, count);
+            if (start >= 0 && bitmap_try_claim_at(chunk, (uint32_t)start, count)) {
+                chunk->next_free_hint.store((uint32_t)start + count, std::memory_order_relaxed);
 
-    mark_pages_allocated(new_chunk, (uint32_t)start, count);
-    new_chunk->next_free_hint = (uint32_t)start + count;
+                for (uint32_t i = 0; i < count; i++) {
+                    PageMeta& pm = chunk->pages[start + i];
+                    pm.block_size = (uint16_t)blk_size;
+                    pm.bucket_idx = (uint16_t)bucket_idx;
+                    pm.block_count = (uint16_t)blk_per_page;
+                    pm.freed_count = 0;
+                    pm.owner_thread = thread_id;
+                    pm.owner_tlc = nullptr;
+                }
 
-    for (uint32_t i = 0; i < count; i++) {
-        PageMeta& pm = new_chunk->pages[start + i];
-        pm.block_size = (uint16_t)blk_size;
-        pm.bucket_idx = (uint16_t)bucket_idx;
-        pm.block_count = (uint16_t)blk_per_page;
-        pm.freed_count = 0;
-        pm.owner_thread = thread_id;
-        pm.owner_tlc = nullptr;
+                arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
+                return page_start(chunk, (uint32_t)start);
+            }
+        }
+
+        // Allocate new chunk (under lock)
+        ChunkHeader* new_chunk = arena_alloc_chunk(arena);
+        if (!new_chunk) return nullptr;
+
+        int start = find_free_pages(new_chunk, count);
+        if (start < 0) return nullptr;
+
+        // New chunk is not visible to other threads yet (just added to list under lock),
+        // so direct claim is safe
+        bitmap_try_claim_at(new_chunk, (uint32_t)start, count);
+        new_chunk->next_free_hint.store((uint32_t)start + count, std::memory_order_relaxed);
+
+        for (uint32_t i = 0; i < count; i++) {
+            PageMeta& pm = new_chunk->pages[start + i];
+            pm.block_size = (uint16_t)blk_size;
+            pm.bucket_idx = (uint16_t)bucket_idx;
+            pm.block_count = (uint16_t)blk_per_page;
+            pm.freed_count = 0;
+            pm.owner_thread = thread_id;
+            pm.owner_tlc = nullptr;
+        }
+
+        arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
+        return page_start(new_chunk, (uint32_t)start);
     }
-
-    arena->stat_page_alloc.fetch_add(count, std::memory_order_relaxed);
-    return page_start(new_chunk, (uint32_t)start);
 }
 
+// Lock-free arena_free_pages: atomic bitmap release, no mutex needed
 void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
     ChunkHeader* chunk = chunk_of(ptr);
     if (chunk->magic != MP_CHUNK_MAGIC || chunk->arena != arena) {
@@ -357,8 +480,7 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
 
     uint32_t start = page_index_of(chunk, ptr);
 
-    std::lock_guard<std::mutex> lock(arena->mutex);
-
+    // Clear PageMeta (page is owned by caller, no contention)
     for (uint32_t i = 0; i < count; i++) {
         PageMeta& pm = chunk->pages[start + i];
         pm.block_size = 0;
@@ -369,7 +491,8 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
         pm.owner_tlc = nullptr;
     }
 
-    mark_pages_free(chunk, start, count);
+    // Atomic bitmap release (lock-free)
+    bitmap_release_pages(chunk, start, count);
     arena->stat_page_free.fetch_add(count, std::memory_order_relaxed);
 
     // Note: we intentionally do NOT decommit pages here.
