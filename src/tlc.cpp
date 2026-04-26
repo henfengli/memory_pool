@@ -2,6 +2,7 @@
 #include <cstring>
 #include <new>
 #include <cstdlib>
+#include <mutex>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,11 +19,12 @@ namespace mp {
 #ifdef _WIN32
 
 static DWORD g_tlc_tls_index = TLS_OUT_OF_INDEXES;
+static std::once_flag g_tlc_tls_once;
 
 static void init_tls_slot() {
-    if (g_tlc_tls_index == TLS_OUT_OF_INDEXES) {
+    std::call_once(g_tlc_tls_once, []() {
         g_tlc_tls_index = TlsAlloc();
-    }
+    });
 }
 
 TLC* tlc_current() {

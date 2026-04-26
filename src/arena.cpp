@@ -265,7 +265,7 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
         for (uint32_t i = 0; i < limit; ) {
             uint32_t word = i / 64;
             uint32_t bit = i % 64;
-            uint64_t w = chunk->page_bitmap[word];
+            uint64_t w = chunk->page_bitmap[word].load(std::memory_order_relaxed);
 
             if (bit == 0 && w == ~0ULL) {
                 run = 0;
