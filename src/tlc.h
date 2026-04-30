@@ -40,7 +40,6 @@ struct Bucket {
 /* --- TLC: Thread-Local Cache --- */
 struct TLC {
     Arena*   arena;
-    uint64_t thread_id;
     Bucket   buckets[MP_NUM_SIZE_CLASSES];
     TLCStats stats;
 

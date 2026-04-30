@@ -13,11 +13,10 @@ struct TLC; // forward declaration
 
 /* --- PageMeta: metadata for one 4KB page within a chunk --- */
 struct PageMeta {
-    uint16_t block_size;     // size class block size (0 = unused)
-    uint16_t bucket_idx;     // size class index
-    uint16_t block_count;    // total blocks in this page
+    uint16_t block_size;     // size class block size (0 = unused, also serves as alloc sentinel)
+    uint16_t bucket_idx;     // size class index (block_count derivable via sc_info)
     uint16_t freed_count;    // freed blocks counter (non-atomic, owner thread only)
-    uint64_t owner_thread;   // thread that owns this page
+    uint16_t _pad;           // align to 8 bytes
     TLC*     owner_tlc;      // direct pointer to owner TLC (for O(1) cross-thread free)
 };
 
@@ -87,7 +86,7 @@ inline void* page_start(ChunkHeader* chunk, uint32_t page_idx) {
 
 Arena* arena_create(uint32_t id, const char* name, size_t max_size);
 void arena_destroy(Arena* arena);
-void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint64_t thread_id);
+void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count);
 void arena_free_pages(Arena* arena, void* ptr, uint32_t count);
 PageMeta* resolve_block_ptr(void* ptr, ChunkHeader** out_chunk);
 

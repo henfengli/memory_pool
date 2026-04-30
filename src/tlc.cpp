@@ -92,7 +92,6 @@ TLC* tlc_get_or_create(Arena* arena) {
     if (!tlc) return nullptr;
 
     tlc->arena = arena;
-    tlc->thread_id = platform::get_thread_id();
     memset(&tlc->stats, 0, sizeof(tlc->stats));
 
     for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
@@ -101,7 +100,7 @@ TLC* tlc_get_or_create(Arena* arena) {
         b.local_free_head = nullptr;
         b.thread_free_head.store(nullptr, std::memory_order_relaxed);
         b.bucket_idx = (uint16_t)i;
-        b.block_size = (uint16_t)sc_block_size(i);
+        b.block_size = (uint16_t)sc_info(i).block_size;
         b.collect_count = 0;
         b.bump_ptr = nullptr;
         b.bump_limit = nullptr;
@@ -124,14 +123,6 @@ TLC* tlc_get_or_create(Arena* arena) {
     return tlc;
 }
 
-// Calculate how many pages to request in one batch for a given size class.
-static uint32_t calc_batch_pages(uint32_t blk_per_page) {
-    if (blk_per_page >= MP_REFILL_BLOCKS) return 1;
-    uint32_t pages = (MP_REFILL_BLOCKS + blk_per_page - 1) / blk_per_page;
-    if (pages > 64) pages = 64;
-    return pages;
-}
-
 // Check if a block belongs to a given page range [page_ptr, page_ptr + count*PAGE_SIZE)
 static inline bool block_in_page(void* blk, void* page_ptr, uint32_t page_count) {
     uintptr_t a = reinterpret_cast<uintptr_t>(blk);
@@ -140,8 +131,8 @@ static inline bool block_in_page(void* blk, void* page_ptr, uint32_t page_count)
 }
 
 // Try to reclaim fully-freed pages from this bucket's page_list.
-// A page is reclaimable when freed_count == block_count (all blocks returned).
-// Called on slow path only (after collect), with frequency control.
+// A page is reclaimable when freed_count == sc_info(bucket_idx).blocks_per_page
+// (all blocks returned). Called on slow path only (after collect), with frequency control.
 static void bucket_try_reclaim_pages(Bucket* b, Arena* arena) {
     PageRange** pp = &b->page_list;
     while (*pp) {
@@ -153,7 +144,7 @@ static void bucket_try_reclaim_pages(Bucket* b, Arena* arena) {
         bool all_freed = true;
         for (uint32_t i = 0; i < pr->count; i++) {
             PageMeta& pm = chunk->pages[pi_start + i];
-            if (pm.freed_count < pm.block_count) {
+            if (pm.freed_count < sc_info(pm.bucket_idx).blocks_per_page) {
                 all_freed = false;
                 break;
             }
@@ -214,6 +205,18 @@ static bool bucket_collect_local(Bucket* b, Arena* arena) {
     return true;
 }
 
+// Walk a thread_free list and increment per-page freed_count for each block.
+// Used by both collect_thread_free (alloc slow path) and tlc_flush (thread exit)
+// since cross-thread frees bypass the normal tlc_free path that would have done this.
+static inline void compensate_freed_counts(FreeBlock* head) {
+    while (head) {
+        ChunkHeader* chunk = chunk_of(head);
+        uint32_t pi = page_index_of(chunk, head);
+        chunk->pages[pi].freed_count++;
+        head = head->next;
+    }
+}
+
 // Collect thread_free (cross-thread frees) into free_head.
 // Called only when free_head is empty.
 // Walk the list to update freed_count per page (these frees bypassed tlc_free).
@@ -221,14 +224,7 @@ static bool bucket_collect_thread_free(Bucket* b) {
     FreeBlock* head = b->thread_free_head.exchange(nullptr, std::memory_order_acquire);
     if (!head) return false;
 
-    // Count freed blocks per page for remote frees
-    FreeBlock* cur = head;
-    while (cur) {
-        ChunkHeader* chunk = chunk_of(cur);
-        uint32_t pi = page_index_of(chunk, cur);
-        chunk->pages[pi].freed_count++;
-        cur = cur->next;
-    }
+    compensate_freed_counts(head);
 
     // free_head is empty when this is called, so just set it directly
     b->free_head = head;
@@ -238,14 +234,13 @@ static bool bucket_collect_thread_free(Bucket* b) {
 // Slow path: allocate a batch of pages from the arena.
 static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
     uint32_t idx = b->bucket_idx;
-    uint32_t blk_per_page = sc_blocks_per_page(idx);
-    uint32_t batch_pages = calc_batch_pages(blk_per_page);
+    uint32_t batch_pages = sc_info(idx).batch_pages;
 
-    void* pages = arena_alloc_pages(tlc->arena, idx, batch_pages, tlc->thread_id);
+    void* pages = arena_alloc_pages(tlc->arena, idx, batch_pages);
     if (!pages) {
         if (batch_pages > 1) {
             batch_pages = 1;
-            pages = arena_alloc_pages(tlc->arena, idx, 1, tlc->thread_id);
+            pages = arena_alloc_pages(tlc->arena, idx, 1);
         }
         if (!pages) return false;
     }
@@ -358,13 +353,8 @@ void tlc_flush(TLC* tlc) {
         Bucket& b = tlc->buckets[i];
 
         // Collect thread_free first to compensate freed_count before page reclaim
-        FreeBlock* remote = b.thread_free_head.exchange(nullptr, std::memory_order_acquire);
-        while (remote) {
-            ChunkHeader* chunk = chunk_of(remote);
-            uint32_t pi = page_index_of(chunk, remote);
-            chunk->pages[pi].freed_count++;
-            remote = remote->next;
-        }
+        compensate_freed_counts(
+            b.thread_free_head.exchange(nullptr, std::memory_order_acquire));
 
         b.free_head = nullptr;
         b.local_free_head = nullptr;

@@ -45,10 +45,6 @@ void mem_recommit(void* ptr, size_t size) {
     (void)ptr; (void)size;
 }
 
-uint64_t get_thread_id() {
-    return (uint64_t)pthread_self();
-}
-
 // Thread-local key for exit callbacks
 static pthread_key_t g_tls_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;

@@ -63,10 +63,6 @@ void mem_recommit(void* ptr, size_t size) {
     VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
 }
 
-uint64_t get_thread_id() {
-    return (uint64_t)GetCurrentThreadId();
-}
-
 // --- Thread exit callback via TLS + DllMain-like mechanism ---
 // We use a TLS slot to store per-thread callback list,
 // and the DLL entry point to fire callbacks on thread detach.

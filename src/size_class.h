@@ -17,6 +17,44 @@ static constexpr size_t kSizeClasses[MP_NUM_SIZE_CLASSES] = {
 
 static constexpr size_t kMaxBlockSize = 4096;
 
+// Per-size-class derived properties packed into one compile-time table.
+// Inspired by tcmalloc's SizeMap and mimalloc's _mi_bin metadata: all
+// derived attributes (block_size, blocks_per_page, batch_pages) are
+// computed once at compile time, so the slow path performs a single load
+// instead of redundant divisions / branches.
+struct SizeClassInfo {
+    uint16_t block_size;       // 16 ~ 4096
+    uint16_t blocks_per_page;  // MP_PAGE_SIZE / block_size
+    uint8_t  batch_pages;      // pages requested per refill (slow path)
+    uint8_t  _pad;             // align to 8 bytes
+};
+
+namespace detail {
+    // Compute pages-per-refill so that batch_pages * blocks_per_page >= MP_REFILL_BLOCKS.
+    // Capped at 64 because a single bitmap word covers 64 pages (see arena.cpp).
+    constexpr uint8_t compute_batch_pages(uint16_t blocks_per_page) {
+        if (blocks_per_page >= MP_REFILL_BLOCKS) return 1;
+        uint32_t pages = (MP_REFILL_BLOCKS + blocks_per_page - 1) / blocks_per_page;
+        return (uint8_t)(pages > 64 ? 64 : pages);
+    }
+
+    struct SCInfoTable {
+        SizeClassInfo data[MP_NUM_SIZE_CLASSES];
+        constexpr SCInfoTable() : data{} {
+            for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
+                uint16_t bs  = (uint16_t)kSizeClasses[i];
+                uint16_t bpp = (uint16_t)(MP_PAGE_SIZE / bs);
+                data[i] = SizeClassInfo{ bs, bpp, compute_batch_pages(bpp), 0 };
+            }
+        }
+    };
+    static constexpr SCInfoTable sc_info_table{};
+} // namespace detail
+
+inline const SizeClassInfo& sc_info(uint32_t idx) {
+    return detail::sc_info_table.data[idx];
+}
+
 // Pre-computed lookup table: size -> size class index (tcmalloc/rpmalloc style).
 // Table indexed by (size + 15) / 16, covering 0..256 (for sizes 0..4096).
 // Generated at compile time to replace binary search with O(1) table lookup.
@@ -46,16 +84,6 @@ namespace detail {
 // Assumes size > 0 && size <= kMaxBlockSize.
 inline uint32_t sc_index_of(size_t size) {
     return detail::sc_table.data[(size + 15) / 16];
-}
-
-// Return the block size for a given size class index.
-inline size_t sc_block_size(uint32_t idx) {
-    return kSizeClasses[idx];
-}
-
-// Return how many blocks fit in one 4KB page for a given size class.
-inline uint32_t sc_blocks_per_page(uint32_t idx) {
-    return (uint32_t)(MP_PAGE_SIZE / kSizeClasses[idx]);
 }
 
 } // namespace mp

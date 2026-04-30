@@ -370,9 +370,8 @@ static int find_free_pages(ChunkHeader* chunk, uint32_t count) {
 #endif
 
 // Lock-free arena_alloc_pages: CAS bitmap + mutex only for new chunk allocation
-void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint64_t thread_id) {
-    size_t blk_size = sc_block_size(bucket_idx);
-    uint32_t blk_per_page = sc_blocks_per_page(bucket_idx);
+void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count) {
+    size_t blk_size = sc_info(bucket_idx).block_size;
 
     // Phase 1 (lock-free): try to CAS-claim pages in existing chunks
     for (ChunkHeader* chunk = arena->chunk_head; chunk; chunk = chunk->next) {
@@ -389,9 +388,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
                 PageMeta& pm = chunk->pages[start + i];
                 pm.block_size = (uint16_t)blk_size;
                 pm.bucket_idx = (uint16_t)bucket_idx;
-                pm.block_count = (uint16_t)blk_per_page;
                 pm.freed_count = 0;
-                pm.owner_thread = thread_id;
                 pm.owner_tlc = nullptr;
             }
 
@@ -408,9 +405,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
                 PageMeta& pm = chunk->pages[start + i];
                 pm.block_size = (uint16_t)blk_size;
                 pm.bucket_idx = (uint16_t)bucket_idx;
-                pm.block_count = (uint16_t)blk_per_page;
                 pm.freed_count = 0;
-                pm.owner_thread = thread_id;
                 pm.owner_tlc = nullptr;
             }
 
@@ -433,9 +428,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
                     PageMeta& pm = chunk->pages[start + i];
                     pm.block_size = (uint16_t)blk_size;
                     pm.bucket_idx = (uint16_t)bucket_idx;
-                    pm.block_count = (uint16_t)blk_per_page;
                     pm.freed_count = 0;
-                    pm.owner_thread = thread_id;
                     pm.owner_tlc = nullptr;
                 }
 
@@ -460,9 +453,7 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count, uint6
             PageMeta& pm = new_chunk->pages[start + i];
             pm.block_size = (uint16_t)blk_size;
             pm.bucket_idx = (uint16_t)bucket_idx;
-            pm.block_count = (uint16_t)blk_per_page;
             pm.freed_count = 0;
-            pm.owner_thread = thread_id;
             pm.owner_tlc = nullptr;
         }
 
@@ -485,9 +476,7 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
         PageMeta& pm = chunk->pages[start + i];
         pm.block_size = 0;
         pm.bucket_idx = 0;
-        pm.block_count = 0;
         pm.freed_count = 0;
-        pm.owner_thread = 0;
         pm.owner_tlc = nullptr;
     }
 

@@ -21,9 +21,6 @@ void  mem_decommit(void* ptr, size_t size);
 // Recommit (make usable again) a previously decommitted range.
 void  mem_recommit(void* ptr, size_t size);
 
-// Get current thread's unique ID.
-uint64_t get_thread_id();
-
 // Callback type for thread exit notification.
 using thread_exit_fn = void(*)(void* arg);
 

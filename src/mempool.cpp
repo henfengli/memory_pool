@@ -127,7 +127,7 @@ MP_API void* mp_malloc(size_t size) {
 
 #ifdef MEMPOOL_DEBUG
     if (ptr && mp::g_config.debug_fill) {
-        memset(ptr, MP_ALLOC_FILL, mp::sc_block_size(idx));
+        memset(ptr, MP_ALLOC_FILL, mp::sc_info(idx).block_size);
     }
 #endif
 
@@ -223,7 +223,7 @@ MP_API void* mp_realloc(void* ptr, size_t new_size) {
     void* new_ptr = mp_malloc(new_size);
     if (!new_ptr) return nullptr;
 
-    size_t old_size = mp::sc_block_size(old_idx);
+    size_t old_size = mp::sc_info(old_idx).block_size;
     size_t copy_size = old_size < new_size ? old_size : new_size;
     memcpy(new_ptr, ptr, copy_size);
     mp_free(ptr);
