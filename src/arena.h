@@ -15,8 +15,7 @@ struct TLC; // forward declaration
 struct PageMeta {
     uint16_t block_size;     // size class block size (0 = unused, also serves as alloc sentinel)
     uint16_t bucket_idx;     // size class index (block_count derivable via sc_info)
-    uint16_t freed_count;    // freed blocks counter (non-atomic, owner thread only)
-    uint16_t _pad;           // align to 8 bytes
+    uint32_t _pad;           // align to 8 bytes
     TLC*     owner_tlc;      // direct pointer to owner TLC (for O(1) cross-thread free)
 };
 

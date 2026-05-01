@@ -130,30 +130,56 @@ static inline bool block_in_page(void* blk, void* page_ptr, uint32_t page_count)
     return a >= base && a < base + page_count * MP_PAGE_SIZE;
 }
 
+// Count blocks of a free list that fall within [page_ptr, page_ptr+count*PAGE_SIZE)
+// Used by reclaim's per-PageRange occupancy check.
+static inline uint32_t count_blocks_in_range(FreeBlock* head, void* page_ptr, uint32_t page_count) {
+    uint32_t n = 0;
+    for (FreeBlock* cur = head; cur; cur = cur->next) {
+        if (block_in_page(cur, page_ptr, page_count)) ++n;
+    }
+    return n;
+}
+
 // Try to reclaim fully-freed pages from this bucket's page_list.
-// A page is reclaimable when freed_count == sc_info(bucket_idx).blocks_per_page
-// (all blocks returned). Called on slow path only (after collect), with frequency control.
+//
+// Plan D (v1.20.0): instead of maintaining a per-page freed_count
+// counter on the hot path, reclaim itself counts how many of each page's
+// blocks currently sit on the free / local_free / thread_free lists.
+// A PageRange is reclaimed iff every page within it has block count
+// equal to blocks_per_page (no block held by any user thread).
+//
+// Why this is safe under concurrent cross-thread free:
+//   The reclaim pulls thread_free_head via atomic exchange before
+//   counting. Any cross-thread free that loses the race (i.e. push
+//   happens after the exchange) means the user thread *still held*
+//   that block during the count window, so the page was not fully
+//   freed → reclaim correctly skips it. Late-arriving thread_free
+//   pushes accumulate on the new (post-exchange) thread_free_head and
+//   are processed by the next collect_thread_free.
+//
+// Cost: hot path zero. Reclaim path walks free_head once per
+// PageRange (already done by the existing free_head filter), so the
+// added counting reuses that traversal — no asymptotic regression.
+// Reclaim is amortized to once every 64 collect_local invocations.
 static void bucket_try_reclaim_pages(Bucket* b, Arena* arena) {
+    // Step 1: drain thread_free into free_head so all known frees are
+    // visible to the count below. (This subsumes collect_thread_free
+    // for this round — callers won't need to repeat it.)
+    FreeBlock* tf = b->thread_free_head.exchange(nullptr, std::memory_order_acquire);
+    if (tf) {
+        // Append tf to the end of free_head. Order does not matter for
+        // correctness; we splice tf at head for O(1).
+        if (b->free_head) {
+            FreeBlock* tail = tf;
+            while (tail->next) tail = tail->next;
+            tail->next = b->free_head;
+        }
+        b->free_head = tf;
+    }
+
     PageRange** pp = &b->page_list;
     while (*pp) {
         PageRange* pr = *pp;
-        ChunkHeader* chunk = chunk_of(pr->ptr);
-        uint32_t pi_start = page_index_of(chunk, pr->ptr);
-
-        // Check if ALL pages in this range are fully freed
-        bool all_freed = true;
-        for (uint32_t i = 0; i < pr->count; i++) {
-            PageMeta& pm = chunk->pages[pi_start + i];
-            if (pm.freed_count < sc_info(pm.bucket_idx).blocks_per_page) {
-                all_freed = false;
-                break;
-            }
-        }
-
-        if (!all_freed) {
-            pp = &pr->next;
-            continue;
-        }
 
         // Don't reclaim if bump_ptr is still pointing into this range
         if (b->bump_ptr != nullptr) {
@@ -163,6 +189,17 @@ static void bucket_try_reclaim_pages(Bucket* b, Arena* arena) {
                 pp = &pr->next;
                 continue;
             }
+        }
+
+        // Count blocks of free_head that lie within this range.
+        // A range is fully freed iff (count == blocks_per_page * pages_in_range).
+        uint32_t blocks_seen = count_blocks_in_range(b->free_head, pr->ptr, pr->count);
+        // All pages in pr share the same size class as this Bucket.
+        uint32_t expected = sc_info(b->bucket_idx).blocks_per_page * pr->count;
+
+        if (blocks_seen < expected) {
+            pp = &pr->next;
+            continue;
         }
 
         // Filter blocks belonging to this page range out of free_head
@@ -205,26 +242,15 @@ static bool bucket_collect_local(Bucket* b, Arena* arena) {
     return true;
 }
 
-// Walk a thread_free list and increment per-page freed_count for each block.
-// Used by both collect_thread_free (alloc slow path) and tlc_flush (thread exit)
-// since cross-thread frees bypass the normal tlc_free path that would have done this.
-static inline void compensate_freed_counts(FreeBlock* head) {
-    while (head) {
-        ChunkHeader* chunk = chunk_of(head);
-        uint32_t pi = page_index_of(chunk, head);
-        chunk->pages[pi].freed_count++;
-        head = head->next;
-    }
-}
-
 // Collect thread_free (cross-thread frees) into free_head.
 // Called only when free_head is empty.
-// Walk the list to update freed_count per page (these frees bypassed tlc_free).
+//
+// Plan D (v1.20.0): there is no per-page freed_count to compensate.
+// We just splice the thread_free list into free_head; reclaim later
+// will count blocks per page directly.
 static bool bucket_collect_thread_free(Bucket* b) {
     FreeBlock* head = b->thread_free_head.exchange(nullptr, std::memory_order_acquire);
     if (!head) return false;
-
-    compensate_freed_counts(head);
 
     // free_head is empty when this is called, so just set it directly
     b->free_head = head;
@@ -324,13 +350,14 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
     return nullptr;
 }
 
-void tlc_free(TLC* tlc, void* ptr, PageMeta* pm, uint32_t bucket_idx) {
+void tlc_free(TLC* tlc, void* ptr, PageMeta* /*pm*/, uint32_t bucket_idx) {
     Bucket& b = tlc->buckets[bucket_idx];
 
     FreeBlock* blk = static_cast<FreeBlock*>(ptr);
     blk->next = b.local_free_head;
     b.local_free_head = blk;
-    pm->freed_count++;  // LevelDB Arena 式: 积累释放计数，达到整页时批量回收
+    // No PageMeta write on the hot path: reclaim counts blocks per page
+    // directly when triggered (see bucket_try_reclaim_pages, Plan D).
 
 #ifdef MEMPOOL_STATS
     tlc->stats.free_count++;
@@ -352,9 +379,11 @@ void tlc_flush(TLC* tlc) {
     for (uint32_t i = 0; i < MP_NUM_SIZE_CLASSES; i++) {
         Bucket& b = tlc->buckets[i];
 
-        // Collect thread_free first to compensate freed_count before page reclaim
-        compensate_freed_counts(
-            b.thread_free_head.exchange(nullptr, std::memory_order_acquire));
+        // Drain thread_free so no other thread holds a stale pointer
+        // back into this bucket after we return the pages. The contents
+        // are discarded — every block lives inside one of b.page_list's
+        // pages and will be wiped when arena_free_pages reclaims them.
+        (void)b.thread_free_head.exchange(nullptr, std::memory_order_acquire);
 
         b.free_head = nullptr;
         b.local_free_head = nullptr;

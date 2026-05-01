@@ -388,7 +388,6 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count) {
                 PageMeta& pm = chunk->pages[start + i];
                 pm.block_size = (uint16_t)blk_size;
                 pm.bucket_idx = (uint16_t)bucket_idx;
-                pm.freed_count = 0;
                 pm.owner_tlc = nullptr;
             }
 
@@ -405,7 +404,6 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count) {
                 PageMeta& pm = chunk->pages[start + i];
                 pm.block_size = (uint16_t)blk_size;
                 pm.bucket_idx = (uint16_t)bucket_idx;
-                pm.freed_count = 0;
                 pm.owner_tlc = nullptr;
             }
 
@@ -428,7 +426,6 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count) {
                     PageMeta& pm = chunk->pages[start + i];
                     pm.block_size = (uint16_t)blk_size;
                     pm.bucket_idx = (uint16_t)bucket_idx;
-                    pm.freed_count = 0;
                     pm.owner_tlc = nullptr;
                 }
 
@@ -453,7 +450,6 @@ void* arena_alloc_pages(Arena* arena, uint32_t bucket_idx, uint32_t count) {
             PageMeta& pm = new_chunk->pages[start + i];
             pm.block_size = (uint16_t)blk_size;
             pm.bucket_idx = (uint16_t)bucket_idx;
-            pm.freed_count = 0;
             pm.owner_tlc = nullptr;
         }
 
@@ -476,7 +472,6 @@ void arena_free_pages(Arena* arena, void* ptr, uint32_t count) {
         PageMeta& pm = chunk->pages[start + i];
         pm.block_size = 0;
         pm.bucket_idx = 0;
-        pm.freed_count = 0;
         pm.owner_tlc = nullptr;
     }
 
