@@ -12,6 +12,7 @@ option(MEMPOOL_BUILD_TESTS "Build tests" OFF)
 option(MEMPOOL_DEBUG "Enable debug fill and checks" OFF)
 option(MEMPOOL_STATS "Enable per-alloc statistics tracking" OFF)
 option(MEMPOOL_USE_CTZ "Use CTZ intrinsic for bitmap scanning" OFF)
+option(MEMPOOL_LINUX_PREFAULT "Linux-only: pass MAP_POPULATE so mmap eagerly commits physical pages (matches Windows VirtualAlloc behavior). Avoids per-page kernel round-trip on first write in mp_free." ON)
 
 # --- Library ---
 set(MEMPOOL_SOURCES
@@ -42,6 +43,9 @@ if(MEMPOOL_STATS)
 endif()
 if(MEMPOOL_USE_CTZ)
     target_compile_definitions(mempool PUBLIC MEMPOOL_USE_CTZ=1)
+endif()
+if(MEMPOOL_LINUX_PREFAULT AND NOT WIN32)
+    target_compile_definitions(mempool PRIVATE MEMPOOL_LINUX_PREFAULT=1)
 endif()
 
 if(NOT WIN32)
