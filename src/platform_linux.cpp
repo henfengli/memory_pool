@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <cstdlib>
 
 namespace mp {
 namespace platform {
