@@ -1,6 +1,10 @@
 # Build output
 build/
+build_*/
 cmake-build-*/
+
+# Local-only experimental scratch (not part of the project)
+test_by_other_ai/
 
 # IDE
 .vscode/

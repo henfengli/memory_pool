@@ -36,9 +36,15 @@ static constexpr size_t MP_USABLE_PAGES   = MP_TOTAL_PAGES - MP_HEADER_PAGES;  /
 #if defined(__GNUC__) || defined(__clang__)
     #define MP_LIKELY(x)   __builtin_expect(!!(x), 1)
     #define MP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+    #define MP_ALWAYS_INLINE __attribute__((always_inline))
+#elif defined(_MSC_VER)
+    #define MP_LIKELY(x)   (x)
+    #define MP_UNLIKELY(x) (x)
+    #define MP_ALWAYS_INLINE __forceinline
 #else
     #define MP_LIKELY(x)   (x)
     #define MP_UNLIKELY(x) (x)
+    #define MP_ALWAYS_INLINE
 #endif
 
 /* --- Bit operations (cross-platform) --- */

@@ -39,21 +39,21 @@ void tlc_set_current(TLC* tlc) {
 
 #else // POSIX
 
-static pthread_key_t g_tlc_key;
-static pthread_once_t g_tlc_key_once = PTHREAD_ONCE_INIT;
-
-static void make_tlc_key() {
-    pthread_key_create(&g_tlc_key, nullptr);
-}
+// Compiler-builtin TLS via __thread + initial-exec model: a single FS-segment
+// load on x86_64. Replaces pthread_once + pthread_getspecific (~32% of churn
+// time per perf record on K=256 16B). Initial-exec requires libmempool.so to
+// be loaded at program startup (normal -lmempool). dlopen post-startup or
+// LD_PRELOAD as the very first malloc replacement will fail to load — for
+// those use cases the build must drop the tls_model attribute and accept
+// general-dynamic TLS overhead.
+static __thread __attribute__((tls_model("initial-exec"))) TLC* g_current_tlc = nullptr;
 
 TLC* tlc_current() {
-    pthread_once(&g_tlc_key_once, make_tlc_key);
-    return static_cast<TLC*>(pthread_getspecific(g_tlc_key));
+    return g_current_tlc;
 }
 
 void tlc_set_current(TLC* tlc) {
-    pthread_once(&g_tlc_key_once, make_tlc_key);
-    pthread_setspecific(g_tlc_key, tlc);
+    g_current_tlc = tlc;
 }
 
 #endif
@@ -226,22 +226,6 @@ static void bucket_try_reclaim_pages(Bucket* b, Arena* arena) {
     }
 }
 
-// Collect local_free into free_head. Called only when free_head is empty,
-// so no need to traverse to find tail — just swap the list pointer.
-// Every 64 collects, try to reclaim fully-freed pages (amortized cost).
-static bool bucket_collect_local(Bucket* b, Arena* arena) {
-    if (!b->local_free_head) return false;
-    b->free_head = b->local_free_head;
-    b->local_free_head = nullptr;
-
-    // Amortized page reclaim: check every 64 collects
-    if (++b->collect_count >= 64) {
-        b->collect_count = 0;
-        bucket_try_reclaim_pages(b, arena);
-    }
-    return true;
-}
-
 // Collect thread_free (cross-thread frees) into free_head.
 // Called only when free_head is empty.
 //
@@ -286,21 +270,12 @@ static bool bucket_alloc_new_pages(TLC* tlc, Bucket* b) {
     return true;
 }
 
-void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
+void* tlc_alloc_slow(TLC* tlc, uint32_t bucket_idx) {
     Bucket& b = tlc->buckets[bucket_idx];
 
-    // Fast path 1: pop from free_head (recycled blocks)
-    if (MP_LIKELY(b.free_head != nullptr)) {
-        FreeBlock* blk = b.free_head;
-        b.free_head = blk->next;
-        // Prefetch next-next block for the NEXT alloc call (rpmalloc/smmalloc trick)
-        // Hides linked-list traversal latency by preloading into L1 cache
-        if (blk->next) __builtin_prefetch(blk->next, 0, 3);
-#ifdef MEMPOOL_STATS
-        tlc->stats.alloc_count++;
-#endif
-        return blk;
-    }
+    // Note: caller (inline tlc_alloc in tlc.h) already handled BOTH
+    // free_head pop and the local_free → free_head swap. We get here only
+    // when both lists are empty.
 
     // Fast path 2: bump pointer allocation (page-boundary safe)
     if (MP_LIKELY(b.bump_ptr != nullptr)) {
@@ -323,15 +298,7 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         b.bump_limit = nullptr;
     }
 
-    // Slow path 1: collect local_free (+ amortized page reclaim)
-    if (bucket_collect_local(&b, tlc->arena)) {
-#ifdef MEMPOOL_STATS
-        tlc->stats.slow_path_hits++;
-#endif
-        return tlc_alloc(tlc, bucket_idx);
-    }
-
-    // Slow path 2: collect thread_free (+ count remote frees)
+    // Slow path 1: collect thread_free (cross-thread frees pile up here)
     if (bucket_collect_thread_free(&b)) {
 #ifdef MEMPOOL_STATS
         tlc->stats.slow_path_hits++;
@@ -339,8 +306,15 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
         return tlc_alloc(tlc, bucket_idx);
     }
 
-    // Slow path 3: allocate new batch of pages from arena
+    // Slow path 2: allocate new batch of pages from arena.
+    // Trigger amortized reclaim every 64 calls into this branch (used to
+    // ride along with bucket_collect_local; that path is now inline so we
+    // anchor reclaim here instead).
     if (bucket_alloc_new_pages(tlc, &b)) {
+        if (++b.collect_count >= 64) {
+            b.collect_count = 0;
+            bucket_try_reclaim_pages(&b, tlc->arena);
+        }
 #ifdef MEMPOOL_STATS
         tlc->stats.slow_path_hits++;
 #endif
@@ -350,19 +324,7 @@ void* tlc_alloc(TLC* tlc, uint32_t bucket_idx) {
     return nullptr;
 }
 
-void tlc_free(TLC* tlc, void* ptr, PageMeta* /*pm*/, uint32_t bucket_idx) {
-    Bucket& b = tlc->buckets[bucket_idx];
-
-    FreeBlock* blk = static_cast<FreeBlock*>(ptr);
-    blk->next = b.local_free_head;
-    b.local_free_head = blk;
-    // No PageMeta write on the hot path: reclaim counts blocks per page
-    // directly when triggered (see bucket_try_reclaim_pages, Plan D).
-
-#ifdef MEMPOOL_STATS
-    tlc->stats.free_count++;
-#endif
-}
+// tlc_alloc and tlc_free are now header-inlined in tlc.h.
 
 void tlc_free_remote(Bucket* bucket, void* ptr) {
     FreeBlock* blk = static_cast<FreeBlock*>(ptr);

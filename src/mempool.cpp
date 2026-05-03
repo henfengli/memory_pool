@@ -51,8 +51,12 @@ static inline void ensure_init() {
     }
 }
 
-// Get the TLC for the current thread (auto-creating if needed)
-static inline TLC* get_tlc() {
+// Get the TLC for the current thread (auto-creating if needed). Marked
+// noinline+cold so the fast paths in mp_malloc / mp_free do not bring in
+// the init machinery (mutex, do_init) and end up emitting a stack frame
+// just to satisfy a branch they almost never take.
+__attribute__((noinline, cold))
+static TLC* get_tlc() {
     ensure_init();
     TLC* tlc = tlc_current();
     if (MP_LIKELY(tlc != nullptr && tlc->arena != nullptr)) return tlc;
