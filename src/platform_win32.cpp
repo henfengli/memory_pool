@@ -30,6 +30,21 @@ void* chunk_alloc(size_t size, size_t alignment) {
     uintptr_t aligned = mp_align_up(addr, alignment);
     void* result = (void*)aligned;
 
+#ifdef MEMPOOL_WIN32_PREFAULT
+    // VirtualAlloc(MEM_COMMIT) reserves PTEs but defers physical page
+    // allocation to first touch (demand-zero). Touch one byte per 4KB page in
+    // [aligned, aligned+size) so the kernel allocates physical frames eagerly,
+    // moving page-fault cost off the alloc/free hot path. Only the aligned
+    // region is touched — the prefix/suffix are not used by mempool and stay
+    // demand-zero until VirtualFree releases them.
+    {
+        volatile unsigned char* p = (volatile unsigned char*)result;
+        for (size_t off = 0; off < size; off += 4096) {
+            p[off] = 0;
+        }
+    }
+#endif
+
     {
         std::lock_guard<std::mutex> lock(g_alloc_map_mutex);
         g_alloc_map[result] = raw;

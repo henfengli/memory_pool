@@ -13,7 +13,8 @@ option(MEMPOOL_BUILD_REAL_TESTS "Build the real_tests/ benchmark suite" OFF)
 option(MEMPOOL_DEBUG "Enable debug fill and checks" OFF)
 option(MEMPOOL_STATS "Enable per-alloc statistics tracking" OFF)
 option(MEMPOOL_USE_CTZ "Use CTZ intrinsic for bitmap scanning" OFF)
-option(MEMPOOL_LINUX_PREFAULT "Linux-only: pass MAP_POPULATE so mmap eagerly commits physical pages (matches Windows VirtualAlloc behavior). Avoids per-page kernel round-trip on first write in mp_free." ON)
+option(MEMPOOL_LINUX_PREFAULT "Linux-only: pass MAP_POPULATE so mmap eagerly commits physical pages. Avoids per-page kernel round-trip on first write in mp_free." ON)
+option(MEMPOOL_WIN32_PREFAULT "Windows-only: after VirtualAlloc(MEM_COMMIT), touch each 4KB page so demand-zero page faults are paid at chunk_alloc time rather than first-write. Matches MEMPOOL_LINUX_PREFAULT semantics." ON)
 
 # --- Library ---
 set(MEMPOOL_SOURCES
@@ -47,6 +48,9 @@ if(MEMPOOL_USE_CTZ)
 endif()
 if(MEMPOOL_LINUX_PREFAULT AND NOT WIN32)
     target_compile_definitions(mempool PRIVATE MEMPOOL_LINUX_PREFAULT=1)
+endif()
+if(MEMPOOL_WIN32_PREFAULT AND WIN32)
+    target_compile_definitions(mempool PRIVATE MEMPOOL_WIN32_PREFAULT=1)
 endif()
 
 if(NOT WIN32)
