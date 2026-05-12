@@ -63,7 +63,7 @@ static const int  kPairs      = 2;
 static const int  kRuns       = 5;
 
 template <typename Alloc, typename Free>
-double run_server(Alloc alloc, Free freefn) {
+double run_server(Alloc alloc, Free freefn, bool use_mp_detach = false) {
     return median_ms(kRuns, [&] {
         std::vector<SPSC> qs(kPairs);
         std::atomic<int> go{0};
@@ -90,7 +90,7 @@ double run_server(Alloc alloc, Free freefn) {
                 // Wait for worker to drain before detaching, otherwise the
                 // worker dereferences pm->owner_tlc on freed pages.
                 while (workers_done.load(std::memory_order_acquire) < kPairs) {}
-                mp_thread_detach();
+                if (use_mp_detach) mp_thread_detach();
             });
             ths.emplace_back([&, p] {                           // worker
                 pin_to_cpu_if_room(p * 2 + 1, total_threads);
@@ -111,7 +111,7 @@ double run_server(Alloc alloc, Free freefn) {
                     got++;
                 }
                 workers_done.fetch_add(1, std::memory_order_release);
-                mp_thread_detach();
+                if (use_mp_detach) mp_thread_detach();
             });
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -136,9 +136,9 @@ int main() {
     printf("  -----------+--------------------------+---------\n");
 
     mp_init(nullptr);
-    double mp_ms = run_server(mp_a, mp_f);
+    double mp_ms = run_server(mp_a, mp_f, true);
     mp_shutdown();
-    double sy_ms = run_server(sy_a, sy_f);
+    double sy_ms = run_server(sy_a, sy_f, false);
     printf("  %-10s | %10.2f   %10.0f   |\n",
            "mempool", mp_ms, ops / mp_ms);
     printf("  %-10s | %10.2f   %10.0f   | x%6.2f\n",

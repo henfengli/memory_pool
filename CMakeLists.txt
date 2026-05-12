@@ -8,8 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-option(MEMPOOL_BUILD_TESTS "Build tests" OFF)
-option(MEMPOOL_BUILD_REAL_TESTS "Build the real_tests/ benchmark suite" OFF)
+option(MEMPOOL_BUILD_TESTS "Build the tests/ benchmark suite" OFF)
 option(MEMPOOL_DEBUG "Enable debug fill and checks" OFF)
 option(MEMPOOL_STATS "Enable per-alloc statistics tracking" OFF)
 option(MEMPOOL_USE_CTZ "Use CTZ intrinsic for bitmap scanning" OFF)
@@ -69,11 +68,7 @@ endif()
 # --- Tests ---
 if(MEMPOOL_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(test)
-endif()
-
-if(MEMPOOL_BUILD_REAL_TESTS)
-    add_subdirectory(real_tests)
+    add_subdirectory(tests)
 endif()
 
 # --- Examples ---
